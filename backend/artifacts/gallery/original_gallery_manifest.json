@@ -1,0 +1,43 @@
+{
+    "gallery_type": "original_gallery",
+    "identity_count": 7,
+    "embedding_dimension": 512,
+    "embeddings_per_identity": 6,
+    "arrays": {
+        "identity_0000": {
+            "gallery_label": "Amulya",
+            "embedding_count": 6,
+            "embedding_dimension": 512
+        },
+        "identity_0001": {
+            "gallery_label": "Haritha",
+            "embedding_count": 6,
+            "embedding_dimension": 512
+        },
+        "identity_0002": {
+            "gallery_label": "Manasa",
+            "embedding_count": 6,
+            "embedding_dimension": 512
+        },
+        "identity_0003": {
+            "gallery_label": "Mounika",
+            "embedding_count": 6,
+            "embedding_dimension": 512
+        },
+        "identity_0004": {
+            "gallery_label": "Revathi",
+            "embedding_count": 6,
+            "embedding_dimension": 512
+        },
+        "identity_0005": {
+            "gallery_label": "Sruthi",
+            "embedding_count": 6,
+            "embedding_dimension": 512
+        },
+        "identity_0006": {
+            "gallery_label": "Taruni",
+            "embedding_count": 6,
+            "embedding_dimension": 512
+        }
+    }
+}

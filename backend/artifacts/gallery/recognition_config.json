@@ -1,0 +1,20 @@
+{
+    "person_detector": "YOLO11n",
+    "tracker": "ByteTrack",
+    "face_detector": "RetinaFace",
+    "recognition_model": "ArcFace",
+    "embedding_dimension": 512,
+    "gallery_type": "test_gallery_no_blur",
+    "yolo_confidence": 0.35,
+    "yolo_image_size": 640,
+    "face_check_interval": 1.5,
+    "lost_track_timeout": 7.0,
+    "min_similarity": 0.38,
+    "min_margin": 0.055,
+    "voting_window": 5,
+    "required_votes": 3,
+    "min_face_height": 110,
+    "min_face_width": 100,
+    "min_face_aspect_ratio": 0.7,
+    "device": "cpu"
+}

@@ -1,0 +1,11 @@
+
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+python-dotenv
+numpy
+opencv-python-headless
+ultralytics
+supabase
+orjson

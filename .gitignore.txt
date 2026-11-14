@@ -1,0 +1,32 @@
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.pytest_cache/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# AI model weights and sensitive data
+backend/models/*.pt
+backend/models/*.onnx
+backend/data/
+backend/artifacts/gallery/
+backend/artifacts/reference_data/
+
+# Logs
+*.log
+logs/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Editors and OS
+.vscode/
+.DS_Store
+Thumbs.db
