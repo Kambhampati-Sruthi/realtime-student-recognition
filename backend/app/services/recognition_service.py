@@ -1,4 +1,3 @@
-
 import time
 
 from collections import Counter, deque
@@ -921,6 +920,7 @@ class RecognitionEngine:
             if state.recognition_event_id is None:
 
                 payload = {
+                    "id": str(uuid4()),
                     "student_id": student_id,
                     "session_id": self.session_id,
                     "track_id": str(track_id),

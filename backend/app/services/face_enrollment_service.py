@@ -1,6 +1,8 @@
 
+import logging
 import uuid
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 
 import cv2
 import numpy as np
@@ -9,21 +11,80 @@ from app.database.supabase_client import get_supabase_client
 from app.services.model_service import embed_faces
 
 
+logger = logging.getLogger(__name__)
+
 BUCKET_NAME = "student-faces"
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 ALLOWED_MIME_TYPES = {
-    "image/jpeg",
-    "image/png",
-    "image/webp",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
 }
 
 EMBEDDING_DIMENSION = 512
 MODEL_NAME = "ArcFace"
+EXPECTED_VARIATIONS = 5
+
+MIN_FACE_SIZE = 160
+FACE_MARGIN_RATIO = 0.40
 
 
 class EnrollmentError(Exception):
     """Raised when face enrollment cannot be completed."""
+
+
+# ---------------------------------------------------------
+# Image validation and decoding
+# ---------------------------------------------------------
+
+def _validate_student_details(
+    roll_no: str,
+    name: str,
+    branch: str,
+    source_type: str,
+    mime_type: str,
+    year_of_study: int | None,
+):
+    if not all(
+        isinstance(value, str)
+        for value in (roll_no, name, branch, source_type, mime_type)
+    ):
+        raise EnrollmentError("Invalid student registration details.")
+
+    if not roll_no or not name or not branch:
+        raise EnrollmentError(
+            "Roll number, name and branch are required."
+        )
+
+    if len(roll_no) > 50:
+        raise EnrollmentError("Roll number cannot exceed 50 characters.")
+
+    if len(name) > 150:
+        raise EnrollmentError("Name cannot exceed 150 characters.")
+
+    if len(branch) > 100:
+        raise EnrollmentError("Branch cannot exceed 100 characters.")
+
+    if source_type not in {"face", "id_card"}:
+        raise EnrollmentError(
+            "Registration source must be 'face' or 'id_card'."
+        )
+
+    if mime_type not in ALLOWED_MIME_TYPES:
+        raise EnrollmentError(
+            "Only JPEG, PNG and WebP images are supported."
+        )
+
+    if year_of_study is not None:
+        if (
+            isinstance(year_of_study, bool)
+            or not isinstance(year_of_study, int)
+            or year_of_study not in (1, 2, 3, 4)
+        ):
+            raise EnrollmentError(
+                "Year of study must be an integer between 1 and 4."
+            )
 
 
 def _decode_image(image_bytes: bytes) -> np.ndarray:
@@ -33,71 +94,138 @@ def _decode_image(image_bytes: bytes) -> np.ndarray:
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise EnrollmentError("Image size must not exceed 5 MB.")
 
-    array = np.frombuffer(image_bytes, dtype=np.uint8)
-    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+
+    image = cv2.imdecode(
+        image_array,
+        cv2.IMREAD_COLOR,
+    )
 
     if image is None:
         raise EnrollmentError(
             "The uploaded file is not a valid image."
         )
 
+    height, width = image.shape[:2]
+
+    if width < 32 or height < 32:
+        raise EnrollmentError(
+            "The uploaded image resolution is too small."
+        )
+
+    if width > 8000 or height > 8000:
+        raise EnrollmentError(
+            "The uploaded image dimensions are too large."
+        )
+
     return image
 
 
-def _detect_largest_face(image: np.ndarray):
-    """Detect the largest usable face using the shared face pipeline."""
+# ---------------------------------------------------------
+# Face detection and cropping
+# ---------------------------------------------------------
+
+def _get_valid_face_detections(image: np.ndarray):
+    """
+    Run the shared RetinaFace/ArcFace pipeline.
+
+    Expected model_service output:
+        [(embedding, (x, y, width, height)), ...]
+
+    Invalid detections are ignored.
+    """
     detections = embed_faces(image)
 
     if not detections:
-        raise EnrollmentError(
-            "No face was detected. Upload a clearer, front-facing image."
-        )
+        return []
 
     valid_faces = []
+
+    image_height, image_width = image.shape[:2]
 
     for item in detections:
         if not isinstance(item, (tuple, list)) or len(item) < 2:
             continue
 
-        box = item[1]
+        embedding, box = item[0], item[1]
 
         if box is None or len(box) != 4:
             continue
 
-        x, y, width, height = [int(value) for value in box]
+        try:
+            x, y, width, height = [
+                int(round(float(value)))
+                for value in box
+            ]
+        except (TypeError, ValueError, OverflowError):
+            continue
 
         if width <= 0 or height <= 0:
             continue
 
-        valid_faces.append(
-            (width * height, x, y, width, height)
-        )
+        if x < 0 or y < 0:
+            continue
 
-    if not valid_faces:
+        if x >= image_width or y >= image_height:
+            continue
+
+        width = min(width, image_width - x)
+        height = min(height, image_height - y)
+
+        if width <= 0 or height <= 0:
+            continue
+
+        valid_faces.append({
+            "embedding": embedding,
+            "box": (x, y, width, height),
+            "area": width * height,
+        })
+
+    return valid_faces
+
+
+def _detect_largest_face(image: np.ndarray):
+    """Return the bounding box of the largest detected face."""
+    faces = _get_valid_face_detections(image)
+
+    if not faces:
         raise EnrollmentError(
-            "A usable face could not be extracted."
+            "No face was detected. Upload a clearer, front-facing image."
         )
 
-    _, x, y, width, height = max(
-        valid_faces,
-        key=lambda item: item[0],
+    largest_face = max(
+        faces,
+        key=lambda face: face["area"],
     )
 
-    return x, y, width, height
+    return largest_face["box"]
 
 
 def _crop_face(image: np.ndarray) -> np.ndarray:
-    """Crop the largest face with a 40% margin and minimum 160px side."""
+    """
+    Crop the largest face with a 40% margin.
+
+    Ensure the smaller crop dimension is at least 160 pixels.
+    """
     image_height, image_width = image.shape[:2]
 
     x, y, face_width, face_height = _detect_largest_face(image)
 
-    margin = int(0.4 * face_width)
+    margin_x = int(face_width * FACE_MARGIN_RATIO)
+    margin_y = int(face_height * FACE_MARGIN_RATIO)
 
-    left = max(0, x - margin)
-    top = max(0, y - margin)
-    right = min(image_width, x + face_width + margin)
-    bottom = min(image_height, y + face_height + margin)
+    left = max(0, x - margin_x)
+    top = max(0, y - margin_y)
+
+    right = min(
+        image_width,
+        x + face_width + margin_x,
+    )
+
+    bottom = min(
+        image_height,
+        y + face_height + margin_y,
+    )
 
     face = image[top:bottom, left:right]
 
@@ -106,17 +234,17 @@ def _crop_face(image: np.ndarray) -> np.ndarray:
 
     minimum_side = min(face.shape[:2])
 
-    if minimum_side < 160:
-        scale = 160.0 / minimum_side
+    if minimum_side < MIN_FACE_SIZE:
+        scale = MIN_FACE_SIZE / float(minimum_side)
 
         new_width = max(
             1,
-            int(face.shape[1] * scale),
+            int(round(face.shape[1] * scale)),
         )
 
         new_height = max(
             1,
-            int(face.shape[0] * scale),
+            int(round(face.shape[0] * scale)),
         )
 
         face = cv2.resize(
@@ -128,9 +256,13 @@ def _crop_face(image: np.ndarray) -> np.ndarray:
     return face
 
 
-def _create_five_variations(face: np.ndarray):
+# ---------------------------------------------------------
+# Five image variations
+# ---------------------------------------------------------
+
+def _create_five_variations(face: np.ndarray) -> list[np.ndarray]:
     """
-    Generate exactly five variations.
+    Generate exactly five variations:
 
     1. Original
     2. Horizontal flip
@@ -138,11 +270,14 @@ def _create_five_variations(face: np.ndarray):
     4. Darker
     5. Brighter
 
-    No Gaussian blur is applied.
+    Gaussian blur is deliberately not used.
     """
     original = face.copy()
 
-    flipped = cv2.flip(original, 1)
+    flipped = cv2.flip(
+        original,
+        1,
+    )
 
     smaller_width = max(
         1,
@@ -178,7 +313,7 @@ def _create_five_variations(face: np.ndarray):
         255,
     ).astype(np.uint8)
 
-    return [
+    variations = [
         original,
         flipped,
         downsampled,
@@ -186,24 +321,45 @@ def _create_five_variations(face: np.ndarray):
         brighter,
     ]
 
+    if len(variations) != EXPECTED_VARIATIONS:
+        raise EnrollmentError(
+            "Exactly five image variations are required."
+        )
+
+    return variations
+
+
+# ---------------------------------------------------------
+# ArcFace embedding extraction
+# ---------------------------------------------------------
 
 def _extract_embedding(image: np.ndarray) -> list[float]:
-    detections = embed_faces(image)
+    """
+    Generate one normalized 512-dimensional ArcFace embedding.
 
-    if not detections:
+    If multiple faces are detected in a variation, use the
+    largest valid face.
+    """
+    faces = _get_valid_face_detections(image)
+
+    if not faces:
         raise EnrollmentError(
             "ArcFace could not generate an embedding for an image variation."
         )
 
+    largest_face = max(
+        faces,
+        key=lambda face: face["area"],
+    )
+
     embedding = np.asarray(
-        detections[0][0],
+        largest_face["embedding"],
         dtype=np.float32,
     ).reshape(-1)
 
     if embedding.shape != (EMBEDDING_DIMENSION,):
         raise EnrollmentError(
-            "Expected a 512-dimensional embedding, "
-            f"received {embedding.shape}."
+            "Expected a 512-dimensional ArcFace embedding."
         )
 
     if not np.all(np.isfinite(embedding)):
@@ -218,9 +374,28 @@ def _extract_embedding(image: np.ndarray) -> list[float]:
             "The generated embedding has zero magnitude."
         )
 
-    embedding = embedding / norm
+    normalized = embedding / norm
 
-    return embedding.astype(np.float32).tolist()
+    return normalized.astype(np.float32).tolist()
+
+
+# ---------------------------------------------------------
+# Student record management
+# ---------------------------------------------------------
+
+def _find_student_by_roll_no(supabase, roll_no: str):
+    result = (
+        supabase.table("students")
+        .select("*")
+        .eq("roll_no", roll_no)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data:
+        return result.data[0]
+
+    return None
 
 
 def _get_or_create_student(
@@ -231,21 +406,21 @@ def _get_or_create_student(
     year_of_study: int | None,
 ):
     """
-    Find the student by unique roll number or create a pending record.
+    Find an existing student or create a pending student.
 
-    Existing student details are deliberately not changed here.
-    They are updated only after all enrollment data has been saved.
+    Existing student details are not changed here.
+    Final updates happen only after image and embeddings are saved.
+
+    A duplicate-insert race is handled by checking the roll number
+    again after an insert failure.
     """
-    result = (
-        supabase.table("students")
-        .select("*")
-        .eq("roll_no", roll_no)
-        .limit(1)
-        .execute()
+    existing_student = _find_student_by_roll_no(
+        supabase,
+        roll_no,
     )
 
-    if result.data:
-        return result.data[0], False
+    if existing_student:
+        return existing_student, False
 
     insert_data = {
         "roll_no": roll_no,
@@ -260,19 +435,40 @@ def _get_or_create_student(
     if year_of_study is not None:
         insert_data["year_of_study"] = year_of_study
 
-    created = (
-        supabase.table("students")
-        .insert(insert_data)
-        .execute()
-    )
-
-    if not created.data:
-        raise EnrollmentError(
-            "Unable to create the pending student record."
+    try:
+        created = (
+            supabase.table("students")
+            .insert(insert_data)
+            .execute()
         )
 
-    return created.data[0], True
+        if not created.data:
+            raise EnrollmentError(
+                "Unable to create the pending student record."
+            )
 
+        return created.data[0], True
+
+    except EnrollmentError:
+        raise
+
+    except Exception:
+        # Another registration request may have created the same
+        # roll number between our initial lookup and insert.
+        existing_student = _find_student_by_roll_no(
+            supabase,
+            roll_no,
+        )
+
+        if existing_student:
+            return existing_student, False
+
+        raise
+
+
+# ---------------------------------------------------------
+# Storage and database cleanup
+# ---------------------------------------------------------
 
 def _cleanup_enrollment(
     supabase,
@@ -280,16 +476,17 @@ def _cleanup_enrollment(
     student_id: str,
     image_id: str,
     storage_path: str,
-    uploaded: bool,
+    storage_upload_attempted: bool,
     was_created: bool,
 ):
     """
-    Best-effort cleanup of records created by this enrollment attempt.
+    Best-effort rollback of records from this enrollment attempt.
 
-    Existing student records are never deleted.
+    Never deletes a student record that existed before this attempt.
     """
     cleanup_errors = []
 
+    # Delete embeddings first because they reference image metadata.
     try:
         (
             supabase.table("student_face_embeddings")
@@ -299,9 +496,10 @@ def _cleanup_enrollment(
         )
     except Exception as exc:
         cleanup_errors.append(
-            f"embedding cleanup: {type(exc).__name__}"
+            f"Embedding cleanup failed: {type(exc).__name__}"
         )
 
+    # Delete image metadata.
     try:
         (
             supabase.table("student_face_images")
@@ -311,19 +509,22 @@ def _cleanup_enrollment(
         )
     except Exception as exc:
         cleanup_errors.append(
-            f"image metadata cleanup: {type(exc).__name__}"
+            f"Image metadata cleanup failed: {type(exc).__name__}"
         )
 
-    if uploaded:
+    # Remove the unique Storage object even if upload returned
+    # an error after the remote service may have accepted it.
+    if storage_upload_attempted:
         try:
             supabase.storage.from_(BUCKET_NAME).remove(
                 [storage_path]
             )
         except Exception as exc:
             cleanup_errors.append(
-                f"Storage cleanup: {type(exc).__name__}"
+                f"Storage cleanup failed: {type(exc).__name__}"
             )
 
+    # Delete only a student created by this enrollment attempt.
     if was_created:
         try:
             (
@@ -334,11 +535,15 @@ def _cleanup_enrollment(
             )
         except Exception as exc:
             cleanup_errors.append(
-                f"new student cleanup: {type(exc).__name__}"
+                f"New student cleanup failed: {type(exc).__name__}"
             )
 
     return cleanup_errors
 
+
+# ---------------------------------------------------------
+# Main enrollment operation
+# ---------------------------------------------------------
 
 def enroll_student(
     *,
@@ -350,67 +555,95 @@ def enroll_student(
     source_type: str,
     year_of_study: int | None = None,
 ):
+    """
+    Register a student using either:
+
+    1. A complete ID-card image.
+    2. A direct face photograph.
+
+    The original uploaded image is saved in private Supabase Storage.
+
+    Database records:
+        students
+        student_face_images
+        student_face_embeddings
+
+    Five normalized ArcFace embeddings are generated for each
+    registration image.
+    """
+
+    # -----------------------------------------------------
+    # 1. Normalize and validate registration details
+    # -----------------------------------------------------
+
+    if not isinstance(roll_no, str):
+        raise EnrollmentError("Invalid roll number.")
+
+    if not isinstance(name, str):
+        raise EnrollmentError("Invalid student name.")
+
+    if not isinstance(branch, str):
+        raise EnrollmentError("Invalid branch.")
+
+    if not isinstance(source_type, str):
+        raise EnrollmentError("Invalid registration source.")
+
+    if not isinstance(mime_type, str):
+        raise EnrollmentError("Invalid image content type.")
+
     roll_no = roll_no.strip()
     name = name.strip()
     branch = branch.strip()
     source_type = source_type.strip().lower()
     mime_type = mime_type.strip().lower()
 
-    if not roll_no or not name or not branch:
-        raise EnrollmentError(
-            "Roll number, name and branch are required."
-        )
+    _validate_student_details(
+        roll_no,
+        name,
+        branch,
+        source_type,
+        mime_type,
+        year_of_study,
+    )
 
-    if source_type not in {"face", "id_card"}:
-        raise EnrollmentError(
-            "source_type must be 'face' or 'id_card'."
-        )
+    if not isinstance(image_bytes, bytes):
+        raise EnrollmentError("Invalid uploaded image data.")
 
-    if mime_type not in ALLOWED_MIME_TYPES:
-        raise EnrollmentError(
-            "Only JPEG, PNG and WebP images are supported."
-        )
-
-    if (
-        year_of_study is not None
-        and year_of_study not in (1, 2, 3, 4)
-    ):
-        raise EnrollmentError(
-            "Year of study must be between 1 and 4."
-        )
-
-    # ---------------------------------------------------------
-    # 1. Decode, detect and crop
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 2. Decode the original uploaded image
+    # -----------------------------------------------------
 
     image = _decode_image(image_bytes)
 
+    # -----------------------------------------------------
+    # 3. Extract the largest face
+    # -----------------------------------------------------
+
     face = _crop_face(image)
+
+    # -----------------------------------------------------
+    # 4. Generate exactly five variations
+    # -----------------------------------------------------
 
     variations = _create_five_variations(face)
 
-    if len(variations) != 5:
-        raise EnrollmentError(
-            "Exactly five image variations are required."
-        )
-
-    # ---------------------------------------------------------
-    # 2. Generate all embeddings before database writes
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 5. Generate all embeddings before database writes
+    # -----------------------------------------------------
 
     embeddings = [
         _extract_embedding(variation)
         for variation in variations
     ]
 
-    if len(embeddings) != 5:
+    if len(embeddings) != EXPECTED_VARIATIONS:
         raise EnrollmentError(
             "Exactly five embeddings are required."
         )
 
-    # ---------------------------------------------------------
-    # 3. Prepare Supabase records
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 6. Prepare Supabase records
+    # -----------------------------------------------------
 
     supabase = get_supabase_client()
 
@@ -424,7 +657,6 @@ def enroll_student(
 
     student_id = str(student["id"])
 
-    # Use a stable, unique label for the recognition gallery.
     gallery_label = (
         student.get("gallery_label")
         or roll_no
@@ -432,46 +664,44 @@ def enroll_student(
 
     image_id = str(uuid.uuid4())
 
-    storage_path = f"{student_id}/{image_id}.jpg"
+    image_extension = ALLOWED_MIME_TYPES[mime_type]
 
-    uploaded = False
+    storage_path = str(
+        PurePosixPath(student_id)
+        / f"{image_id}{image_extension}"
+    )
+
+    storage_upload_attempted = False
     final_student_update_attempted = False
 
     enrolled_at = datetime.now(timezone.utc).isoformat()
 
+    # -----------------------------------------------------
+    # 7. Persist image, metadata, embeddings and student status
+    # -----------------------------------------------------
+
     try:
-        # -----------------------------------------------------
-        # 4. Store the original uploaded image in private Storage
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 7A. Upload the original image bytes
+        # -------------------------------------------------
 
-        success, encoded = cv2.imencode(
-            ".jpg",
-            image,
-            [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                95,
-            ],
-        )
-
-        if not success:
-            raise EnrollmentError(
-                "Unable to encode the original image."
-            )
+        # Important:
+        # Store the exact uploaded file bytes, not the cropped
+        # face and not an image re-encoded by OpenCV.
+        storage_upload_attempted = True
 
         supabase.storage.from_(BUCKET_NAME).upload(
             storage_path,
-            encoded.tobytes(),
+            image_bytes,
             {
-                "content-type": "image/jpeg",
+                "content-type": mime_type,
                 "upsert": "false",
             },
         )
 
-        uploaded = True
-
-        # -----------------------------------------------------
-        # 5. Store image metadata
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 7B. Save image metadata
+        # -------------------------------------------------
 
         image_record = {
             "id": image_id,
@@ -488,12 +718,12 @@ def enroll_student(
 
         if not image_result.data:
             raise EnrollmentError(
-                "Unable to save face-image metadata."
+                "Unable to save registration image metadata."
             )
 
-        # -----------------------------------------------------
-        # 6. Store all five ArcFace embeddings
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 7C. Save all five ArcFace embeddings
+        # -------------------------------------------------
 
         embedding_records = []
 
@@ -516,15 +746,18 @@ def enroll_student(
             .execute()
         )
 
-        if len(embedding_result.data or []) != 5:
+        saved_embeddings = embedding_result.data or []
+
+        if len(saved_embeddings) != EXPECTED_VARIATIONS:
             raise EnrollmentError(
-                "All five embeddings were not saved."
+                "All five face embeddings were not saved."
             )
 
-        # -----------------------------------------------------
-        # 7. Finalize student enrollment last
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 7D. Finalize student enrollment
+        # -------------------------------------------------
 
+        # This is intentionally the final database operation.
         update_data = {
             "name": name,
             "branch": branch,
@@ -553,10 +786,22 @@ def enroll_student(
                 "Unable to finalize student enrollment."
             )
 
+        enrolled_student = status_result.data[0]
+
+        logger.info(
+            "Student enrollment completed: roll_no=%s, image_id=%s",
+            roll_no,
+            image_id,
+        )
+
+        # -------------------------------------------------
+        # 8. Return frontend-compatible response
+        # -------------------------------------------------
+
         return {
             "success": True,
             "message": "Student enrolled successfully.",
-            "student": status_result.data[0],
+            "student": enrolled_student,
             "student_id": student_id,
             "roll_no": roll_no,
             "name": name,
@@ -564,24 +809,29 @@ def enroll_student(
             "source_type": source_type,
             "image_id": image_id,
             "storage_path": storage_path,
-            "embedding_count": 5,
+            "embedding_count": EXPECTED_VARIATIONS,
             "embedding_dimension": EMBEDDING_DIMENSION,
             "enrollment_status": "enrolled",
             "created": was_created,
         }
 
     except Exception as exc:
+
+        # -------------------------------------------------
+        # 9. Roll back this enrollment attempt
+        # -------------------------------------------------
+
         cleanup_errors = _cleanup_enrollment(
             supabase,
             student_id=student_id,
             image_id=image_id,
             storage_path=storage_path,
-            uploaded=uploaded,
+            storage_upload_attempted=storage_upload_attempted,
             was_created=was_created,
         )
 
-        # If finalization may have reached Supabase but the response
-        # failed, restore the previous student fields when possible.
+        # If an existing student's final update may have reached
+        # Supabase but the response failed, restore their old values.
         if final_student_update_attempted and not was_created:
             restore_fields = {
                 key: student.get(key)
@@ -610,20 +860,26 @@ def enroll_student(
                 )
             except Exception as restore_exc:
                 cleanup_errors.append(
-                    "student restore: "
+                    "Student restoration failed: "
                     f"{type(restore_exc).__name__}"
                 )
 
         if cleanup_errors:
-            print(
-                "[ENROLLMENT CLEANUP WARNING] "
-                + "; ".join(cleanup_errors)
+            logger.error(
+                "Enrollment rollback had errors for roll_no=%s: %s",
+                roll_no,
+                "; ".join(cleanup_errors),
             )
 
         if isinstance(exc, EnrollmentError):
             raise
 
+        logger.exception(
+            "Student enrollment failed for roll_no=%s",
+            roll_no,
+        )
+
         raise EnrollmentError(
-            "Enrollment could not be completed. "
-            f"Reason: {type(exc).__name__}: {exc}"
+            "Student enrollment could not be completed. "
+            "Please verify the image and try again."
         ) from exc

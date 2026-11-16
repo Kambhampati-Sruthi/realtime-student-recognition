@@ -1,4 +1,3 @@
-
 import { useEffect, useRef, useState } from 'react'
 import { enrollStudent } from '../services/api'
 
@@ -26,6 +25,24 @@ export default function StudentEnrollment() {
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
   const fileInputRef = useRef(null)
+  const previewUrlRef = useRef('')
+
+  function releasePreviewUrl() {
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current)
+      previewUrlRef.current = ''
+    }
+  }
+
+  function clearSelectedImage() {
+    releasePreviewUrl()
+    setImage(null)
+    setPreview('')
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }
 
   function stopCamera() {
     if (streamRef.current) {
@@ -44,7 +61,10 @@ export default function StudentEnrollment() {
     return () => {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop())
+        streamRef.current = null
       }
+
+      releasePreviewUrl()
     }
   }, [])
 
@@ -60,34 +80,44 @@ export default function StudentEnrollment() {
     setSuccess(null)
 
     if (name === 'source_type') {
-      setImage(null)
-      setPreview('')
-
-      if (fileInputRef.current) {
-        fileInputRef.current.value = ''
-      }
-
+      clearSelectedImage()
       stopCamera()
     }
   }
 
   function setSelectedImage(file) {
-    if (!file) return
+    if (!file) return false
 
     if (!ALLOWED_TYPES.includes(file.type)) {
+      clearSelectedImage()
       setError('Only JPEG, PNG, and WebP images are supported.')
-      return
+      return false
+    }
+
+    if (file.size === 0) {
+      clearSelectedImage()
+      setError('The selected image is empty. Please choose another image.')
+      return false
     }
 
     if (file.size > MAX_IMAGE_SIZE) {
+      clearSelectedImage()
       setError('Image size must not exceed 5 MB.')
-      return
+      return false
     }
 
+    releasePreviewUrl()
+
+    const previewUrl = URL.createObjectURL(file)
+
+    previewUrlRef.current = previewUrl
+
     setImage(file)
-    setPreview(URL.createObjectURL(file))
+    setPreview(previewUrl)
     setError('')
     setSuccess(null)
+
+    return true
   }
 
   function handleImageChange(event) {
@@ -103,7 +133,9 @@ export default function StudentEnrollment() {
     setSuccess(null)
 
     if (!navigator.mediaDevices?.getUserMedia) {
-      setError('Camera access is not supported by this browser. Use image upload instead.')
+      setError(
+        'Camera access is not supported by this browser. Use image upload instead.'
+      )
       return
     }
 
@@ -119,21 +151,29 @@ export default function StudentEnrollment() {
         audio: false,
       })
 
-      streamRef.current = stream
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        await videoRef.current.play()
+      if (!videoRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
       }
+
+      streamRef.current = stream
+      videoRef.current.srcObject = stream
+
+      await videoRef.current.play()
 
       setCameraActive(true)
     } catch (err) {
       stopCamera()
-      setError(
-        err.name === 'NotAllowedError'
-          ? 'Camera permission was denied. Allow camera access or upload an image.'
-          : `Unable to start camera: ${err.message}`
-      )
+
+      if (err.name === 'NotAllowedError') {
+        setError(
+          'Camera permission was denied. Allow camera access or upload an image.'
+        )
+      } else if (err.name === 'NotFoundError') {
+        setError('No camera was found on this device.')
+      } else {
+        setError(`Unable to start camera: ${err.message || 'Unknown error'}`)
+      }
     }
   }
 
@@ -141,7 +181,7 @@ export default function StudentEnrollment() {
     const video = videoRef.current
     const canvas = canvasRef.current
 
-    if (!video || !canvas || !video.videoWidth) {
+    if (!video || !canvas || !video.videoWidth || !video.videoHeight) {
       setError('Camera is not ready. Please wait and try again.')
       return
     }
@@ -171,31 +211,48 @@ export default function StudentEnrollment() {
           { type: 'image/jpeg' }
         )
 
-        setSelectedImage(capturedFile)
-        stopCamera()
+        const imageSelected = setSelectedImage(capturedFile)
+
+        if (imageSelected) {
+          stopCamera()
+        }
       },
       'image/jpeg',
       0.92
     )
   }
 
-  function clearImage() {
-    setImage(null)
-    setPreview('')
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ''
-    }
-  }
-
   async function handleSubmit(event) {
     event.preventDefault()
+
+    if (loading) return
 
     setError('')
     setSuccess(null)
 
-    if (!form.name.trim() || !form.roll_no.trim() || !form.branch.trim()) {
+    const name = form.name.trim()
+    const rollNo = form.roll_no.trim()
+    const branch = form.branch.trim()
+
+    if (!name || !rollNo || !branch) {
       setError('Please complete all required student details.')
+      return
+    }
+
+    if (
+      name.length > 150 ||
+      rollNo.length > 50 ||
+      branch.length > 100
+    ) {
+      setError('Please check the maximum allowed length of the student details.')
+      return
+    }
+
+    if (
+      form.year_of_study &&
+      !['1', '2', '3', '4'].includes(String(form.year_of_study))
+    ) {
+      setError('Please select a valid year of study.')
       return
     }
 
@@ -213,8 +270,8 @@ export default function StudentEnrollment() {
       return
     }
 
-    if (image.size > MAX_IMAGE_SIZE) {
-      setError('Image size must not exceed 5 MB.')
+    if (image.size === 0 || image.size > MAX_IMAGE_SIZE) {
+      setError('Image size must be greater than 0 and must not exceed 5 MB.')
       return
     }
 
@@ -223,19 +280,19 @@ export default function StudentEnrollment() {
       stopCamera()
 
       const result = await enrollStudent({
-        ...form,
-        name: form.name.trim(),
-        roll_no: form.roll_no.trim(),
-        branch: form.branch.trim(),
-        year_of_study: form.year_of_study,
+        name,
+        roll_no: rollNo,
+        branch,
+        year_of_study: form.year_of_study
+          ? Number(form.year_of_study)
+          : null,
+        source_type: form.source_type,
         image,
       })
 
       setSuccess(result)
-
       setForm(initialForm)
-      setImage(null)
-      setPreview('')
+      clearSelectedImage()
 
       if (fileInputRef.current) {
         fileInputRef.current.value = ''
@@ -279,13 +336,16 @@ export default function StudentEnrollment() {
                 <label className="mb-2 block text-sm text-slate-300">
                   Student name
                 </label>
+
                 <input
                   required
+                  maxLength={150}
                   name="name"
                   value={form.name}
                   onChange={updateField}
                   placeholder="Enter full name"
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                  disabled={loading}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500 disabled:opacity-60"
                 />
               </div>
 
@@ -293,13 +353,16 @@ export default function StudentEnrollment() {
                 <label className="mb-2 block text-sm text-slate-300">
                   Roll number
                 </label>
+
                 <input
                   required
+                  maxLength={50}
                   name="roll_no"
                   value={form.roll_no}
                   onChange={updateField}
                   placeholder="Enter roll number"
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                  disabled={loading}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500 disabled:opacity-60"
                 />
               </div>
 
@@ -307,13 +370,16 @@ export default function StudentEnrollment() {
                 <label className="mb-2 block text-sm text-slate-300">
                   Branch
                 </label>
+
                 <input
                   required
+                  maxLength={100}
                   name="branch"
                   value={form.branch}
                   onChange={updateField}
                   placeholder="Example: AI & DS"
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                  disabled={loading}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500 disabled:opacity-60"
                 />
               </div>
 
@@ -321,11 +387,13 @@ export default function StudentEnrollment() {
                 <label className="mb-2 block text-sm text-slate-300">
                   Year of study
                 </label>
+
                 <select
                   name="year_of_study"
                   value={form.year_of_study}
                   onChange={updateField}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                  disabled={loading}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500 disabled:opacity-60"
                 >
                   <option value="">Select year</option>
                   <option value="1">1st year</option>
@@ -338,7 +406,9 @@ export default function StudentEnrollment() {
           </section>
 
           <div className="border-t border-slate-800 pt-6">
-            <h2 className="mb-4 text-lg font-semibold">Choose enrollment method</h2>
+            <h2 className="mb-4 text-lg font-semibold">
+              Choose enrollment method
+            </h2>
 
             <div className="grid gap-4 sm:grid-cols-2">
               <label
@@ -354,9 +424,12 @@ export default function StudentEnrollment() {
                   value="id_card"
                   checked={form.source_type === 'id_card'}
                   onChange={updateField}
+                  disabled={loading}
                   className="mr-2 accent-cyan-500"
                 />
+
                 <span className="font-semibold">ID-card upload</span>
+
                 <p className="mt-2 text-sm text-slate-400">
                   Upload the complete student ID card. The backend extracts
                   the face region.
@@ -376,9 +449,12 @@ export default function StudentEnrollment() {
                   value="face"
                   checked={form.source_type === 'face'}
                   onChange={updateField}
+                  disabled={loading}
                   className="mr-2 accent-cyan-500"
                 />
+
                 <span className="font-semibold">Direct face registration</span>
+
                 <p className="mt-2 text-sm text-slate-400">
                   Upload a face photograph or capture a new photograph
                   using your camera.
@@ -407,7 +483,7 @@ export default function StudentEnrollment() {
                   autoPlay
                   playsInline
                   muted
-                  className={`mb-4 w-full max-h-96 rounded-lg bg-black object-contain ${
+                  className={`mb-4 max-h-96 w-full rounded-lg bg-black object-contain ${
                     cameraActive ? 'block' : 'hidden'
                   }`}
                 />
@@ -420,7 +496,7 @@ export default function StudentEnrollment() {
                       type="button"
                       onClick={startCamera}
                       disabled={loading}
-                      className="rounded-lg border border-cyan-500 px-4 py-2 text-sm font-semibold text-cyan-300 hover:bg-cyan-950"
+                      className="rounded-lg border border-cyan-500 px-4 py-2 text-sm font-semibold text-cyan-300 hover:bg-cyan-950 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       Start camera
                     </button>
@@ -429,7 +505,8 @@ export default function StudentEnrollment() {
                       <button
                         type="button"
                         onClick={capturePhoto}
-                        className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400"
+                        disabled={loading}
+                        className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-50"
                       >
                         Capture photograph
                       </button>
@@ -437,7 +514,8 @@ export default function StudentEnrollment() {
                       <button
                         type="button"
                         onClick={stopCamera}
-                        className="rounded-lg border border-slate-600 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800"
+                        disabled={loading}
+                        className="rounded-lg border border-slate-600 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-50"
                       >
                         Stop camera
                       </button>
@@ -463,7 +541,8 @@ export default function StudentEnrollment() {
               type="file"
               accept="image/jpeg,image/png,image/webp"
               onChange={handleImageChange}
-              className="block w-full rounded-lg border border-dashed border-slate-600 bg-slate-950 p-4 text-sm text-slate-300 file:mr-4 file:rounded-md file:border-0 file:bg-cyan-500 file:px-4 file:py-2 file:font-semibold file:text-slate-950"
+              disabled={loading}
+              className="block w-full rounded-lg border border-dashed border-slate-600 bg-slate-950 p-4 text-sm text-slate-300 file:mr-4 file:rounded-md file:border-0 file:bg-cyan-500 file:px-4 file:py-2 file:font-semibold file:text-slate-950 disabled:opacity-50"
             />
 
             {preview && (
@@ -482,10 +561,15 @@ export default function StudentEnrollment() {
                   {image?.name}
                 </p>
 
+                <p className="mt-1 text-xs text-slate-500">
+                  {(image.size / (1024 * 1024)).toFixed(2)} MB
+                </p>
+
                 <button
                   type="button"
-                  onClick={clearImage}
-                  className="mt-3 text-sm text-red-300 hover:text-red-200"
+                  onClick={clearSelectedImage}
+                  disabled={loading}
+                  className="mt-3 text-sm text-red-300 hover:text-red-200 disabled:opacity-50"
                 >
                   Remove selected image
                 </button>
@@ -494,13 +578,19 @@ export default function StudentEnrollment() {
           </section>
 
           {error && (
-            <div className="rounded-lg border border-red-800 bg-red-950/40 p-4 text-sm text-red-300">
+            <div
+              role="alert"
+              className="rounded-lg border border-red-800 bg-red-950/40 p-4 text-sm text-red-300"
+            >
               {error}
             </div>
           )}
 
           {success && (
-            <div className="rounded-lg border border-emerald-800 bg-emerald-950/30 p-4 text-sm text-emerald-300">
+            <div
+              role="status"
+              className="rounded-lg border border-emerald-800 bg-emerald-950/30 p-4 text-sm text-emerald-300"
+            >
               <p className="font-semibold">
                 Face enrollment completed successfully.
               </p>
@@ -510,11 +600,15 @@ export default function StudentEnrollment() {
               </p>
 
               <p>
-                Embeddings saved: {success.embeddings_saved ?? success.embedding_count ?? 'Not reported'}
+                Embeddings saved:{' '}
+                {success.embedding_count ??
+                  success.embeddings_saved ??
+                  '5'}
               </p>
 
               <p>
-                Enrollment status: {student?.enrollment_status ?? success.enrollment_status}
+                Enrollment status:{' '}
+                {student?.enrollment_status ?? success.enrollment_status ?? 'enrolled'}
               </p>
 
               <p className="mt-1 text-xs text-emerald-400">

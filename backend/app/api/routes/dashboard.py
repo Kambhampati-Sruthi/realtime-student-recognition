@@ -1,4 +1,3 @@
-
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -7,10 +6,22 @@ from fastapi import APIRouter, HTTPException, Query
 from app.database.supabase_client import get_supabase_client
 
 
-router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+router = APIRouter(
+    prefix="/dashboard",
+    tags=["Dashboard"],
+)
 
 
-def _count(query):
+def _count_rows(supabase, table_name: str, filters=None) -> int:
+    """Return an exact row count without downloading the rows."""
+    query = (
+        supabase.table(table_name)
+        .select("id", count="exact", head=True)
+    )
+
+    for column, value in (filters or {}).items():
+        query = query.eq(column, value)
+
     result = query.execute()
     return int(result.count or 0)
 
@@ -28,7 +39,6 @@ def _get_recent_events(supabase, limit: int = 10):
     )
 
     events = result.data or []
-
     student_ids = list({
         event["student_id"]
         for event in events
@@ -36,7 +46,6 @@ def _get_recent_events(supabase, limit: int = 10):
     })
 
     students_by_id = {}
-
     if student_ids:
         students_result = (
             supabase.table("students")
@@ -44,17 +53,14 @@ def _get_recent_events(supabase, limit: int = 10):
             .in_("id", student_ids)
             .execute()
         )
-
         students_by_id = {
             student["id"]: student
             for student in (students_result.data or [])
         }
 
     output = []
-
     for event in events:
         student = students_by_id.get(event.get("student_id"), {})
-
         output.append({
             "event_id": event.get("id"),
             "student_id": event.get("student_id"),
@@ -89,13 +95,10 @@ def _get_activity(supabase, days: int):
     )
 
     counts = Counter()
-
     for event in result.data or []:
         created_at = event.get("created_at")
-
         if not created_at:
             continue
-
         try:
             parsed = datetime.fromisoformat(
                 created_at.replace("Z", "+00:00")
@@ -106,11 +109,8 @@ def _get_activity(supabase, days: int):
             continue
 
     activity = []
-
     for offset in range(days):
-        day = (start_date + timedelta(days=offset)).date()
-        day_string = day.isoformat()
-
+        day_string = (start_date + timedelta(days=offset)).date().isoformat()
         activity.append({
             "date": day_string,
             "count": counts.get(day_string, 0),
@@ -121,48 +121,32 @@ def _get_activity(supabase, days: int):
 
 @router.get("/summary")
 def get_dashboard_summary():
+    """Return live dashboard statistics, 7-day activity, and recent events."""
     try:
         supabase = get_supabase_client()
 
         now = datetime.now(timezone.utc)
         today_start = now.replace(
-            hour=0, minute=0, second=0, microsecond=0
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
         )
 
-        total_students = _count(
-            supabase.table("students")
-            .select("id", count="exact", head=True)
-        )
+        total_students = _count_rows(supabase, "students")
+        active_students = _count_rows(supabase, "students", {"is_active": True})
+        enrolled_students = _count_rows(supabase, "students", {"enrollment_status": "enrolled"})
+        total_events = _count_rows(supabase, "recognition_events")
+        active_sessions = _count_rows(supabase, "recognition_sessions", {"status": "active"})
+        configured_cameras = _count_rows(supabase, "cameras", {"is_active": True})
 
-        active_students = _count(
-            supabase.table("students")
-            .select("id", count="exact", head=True)
-            .eq("is_active", True)
-        )
-
-        today_recognitions = _count(
+        today_result = (
             supabase.table("recognition_events")
             .select("id", count="exact", head=True)
             .gte("created_at", today_start.isoformat())
-            .lte("created_at", now.isoformat())
+            .execute()
         )
-
-        total_events = _count(
-            supabase.table("recognition_events")
-            .select("id", count="exact", head=True)
-        )
-
-        active_sessions = _count(
-            supabase.table("recognition_sessions")
-            .select("id", count="exact", head=True)
-            .eq("status", "active")
-        )
-
-        configured_cameras = _count(
-            supabase.table("cameras")
-            .select("id", count="exact", head=True)
-            .eq("is_active", True)
-        )
+        today_recognitions = int(today_result.count or 0)
 
         recent_events = _get_recent_events(supabase, limit=10)
         activity = _get_activity(supabase, days=7)
@@ -173,6 +157,7 @@ def get_dashboard_summary():
             "metrics": {
                 "total_students": total_students,
                 "active_students": active_students,
+                "enrolled_students": enrolled_students,
                 "today_recognitions": today_recognitions,
                 "total_events": total_events,
                 "active_cameras": active_sessions,
@@ -186,7 +171,7 @@ def get_dashboard_summary():
         raise HTTPException(
             status_code=500,
             detail=(
-                "Unable to load dashboard data: "
+                "Unable to retrieve dashboard summary: "
                 f"{type(exc).__name__}: {exc}"
             ),
         ) from exc
@@ -194,19 +179,25 @@ def get_dashboard_summary():
 
 @router.get("/activity")
 def get_dashboard_activity(
-    days: int = Query(default=7, ge=1, le=90),
+    days: int = Query(default=7, ge=1, le=365),
 ):
+    """Return daily recognition-event counts for the requested period."""
     try:
         supabase = get_supabase_client()
+        activity = _get_activity(supabase, days)
 
         return {
             "success": True,
             "days": days,
-            "activity": _get_activity(supabase, days),
+            "activity": activity,
+            "total_events": sum(item["count"] for item in activity),
         }
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Unable to load recognition activity: {exc}",
+            detail=(
+                "Unable to retrieve dashboard activity: "
+                f"{type(exc).__name__}: {exc}"
+            ),
         ) from exc
