@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
 
-import httpx
 import numpy as np
 
 from app.config import settings
@@ -16,11 +15,13 @@ from app.services.model_service import (
     initialize_ai_models,
 )
 
-from app.services.gallery_service import load_face_gallery
+from app.services.gallery_service import load_recognition_config
 
 from app.services.gallery_student_service import (
     load_gallery_student_mapping,
 )
+
+from app.database.supabase_client import get_supabase_client
 
 
 @dataclass
@@ -76,7 +77,7 @@ class RecognitionEngine:
         512-dimensional face embeddings.
 
     Existing gallery:
-        Seven enrolled student identities.
+        Active enrolled students and their ArcFace embeddings from Supabase.
 
     Temporal voting:
         Confirms identity across multiple face checks.
@@ -97,6 +98,12 @@ class RecognitionEngine:
 
         self.track_states = {}
 
+        self.supabase = None
+
+        self.last_heartbeat = 0.0
+
+        self.last_gallery_refresh = 0.0
+
     # ---------------------------------------------------------
     # 1. START RECOGNITION SESSION
     # ---------------------------------------------------------
@@ -111,89 +118,82 @@ class RecognitionEngine:
 
         print("\n========== RECOGNITION SESSION ==========")
 
+        session_created = False
+
         try:
 
             print("[SESSION] Initializing AI models...")
 
             self.models = initialize_ai_models()
 
-            print("[SESSION] Loading gallery configuration...")
+            print("[SESSION] Connecting to Supabase...")
 
-            _, _, self.config = load_face_gallery()
+            self.supabase = get_supabase_client()
 
-            print("[SESSION] Loading Supabase student mapping...")
+            if self.supabase is None:
+
+                raise RuntimeError(
+                    "Supabase client could not be initialized."
+                )
+
+            print("[SESSION] Loading recognition configuration...")
+
+            self.config = load_recognition_config()
+
+            print("[SESSION] Loading enrolled student embeddings...")
 
             self.student_mapping = load_gallery_student_mapping()
 
             if not self.student_mapping:
 
                 raise RuntimeError(
-                    "Student gallery mapping is empty."
+                    "Student gallery is empty. Enroll students and generate face embeddings before starting recognition."
                 )
 
             active_count = sum(
                 1
                 for item in self.student_mapping.values()
                 if item.get("is_active", False)
+                and item.get("embeddings") is not None
+                and len(item.get("embeddings", [])) > 0
             )
 
             if active_count == 0:
 
                 raise RuntimeError(
-                    "No active students are available for recognition."
+                    "No active enrolled students with face embeddings are available for recognition."
                 )
 
-            required_config = [
-                "min_face_height",
-                "min_face_width",
-                "min_face_aspect_ratio",
-                "min_similarity",
-                "min_margin",
-                "voting_window",
-                "required_votes",
-                "face_check_interval",
-                "lost_track_timeout",
-                "yolo_confidence",
-                "yolo_image_size",
-            ]
-
-            missing_config = [
-                key
-                for key in required_config
-                if key not in self.config
-            ]
-
-            if missing_config:
-
-                raise RuntimeError(
-                    f"Missing recognition configuration: {missing_config}"
-                )
-
-            if int(self.config["required_votes"]) < 1:
-
-                raise RuntimeError(
-                    "Required votes must be at least 1."
-                )
-
-            if (
-                int(self.config["voting_window"])
-                < int(self.config["required_votes"])
-            ):
-
-                raise RuntimeError(
-                    "Voting window cannot be smaller than required votes."
-                )
+            self._validate_recognition_config(self.config)
 
             self.track_states = {}
 
             self._reset_tracker()
 
+            # recognition_sessions.id has no database default, so the
+            # application generates and explicitly inserts the UUID.
             self.session_id = str(uuid4())
 
-            print("[SESSION] Recognition session started.")
+            now = datetime.now(timezone.utc).isoformat()
+
+            self.supabase.table("recognition_sessions").insert({
+                "id": self.session_id,
+                "camera_id": None,
+                "started_at": now,
+                "last_heartbeat": now,
+                "status": "active",
+            }).execute()
+
+            session_created = True
+
+            monotonic_now = time.monotonic()
+            self.last_heartbeat = monotonic_now
+            self.last_gallery_refresh = monotonic_now
+
+            print("[SESSION] Recognition session started and saved to Supabase.")
 
             print(
-                f"[SESSION] Active identities: {active_count}"
+                f"[SESSION] Active enrolled identities: {active_count}"
             )
 
             print(
@@ -211,17 +211,122 @@ class RecognitionEngine:
 
             return self.session_id
 
-        except Exception:
+        except Exception as exc:
+
+            print("[SESSION ERROR] Could not start recognition session:", repr(exc))
+
+            if session_created and self.supabase is not None and self.session_id:
+
+                try:
+
+                    now = datetime.now(timezone.utc).isoformat()
+
+                    self.supabase.table("recognition_sessions").update({
+                        "status": "error",
+                        "stopped_at": now,
+                        "last_heartbeat": now,
+                    }).eq("id", self.session_id).execute()
+
+                except Exception as db_exc:
+
+                    print("[DATABASE ERROR] Could not mark failed session:", repr(db_exc))
 
             self.track_states.clear()
-
             self.session_id = None
-
             self.student_mapping = None
-
             self.config = None
+            self.supabase = None
+            self.last_heartbeat = 0.0
+            self.last_gallery_refresh = 0.0
 
             raise
+
+    def _validate_recognition_config(self, config):
+
+        required_config = [
+            "min_face_height",
+            "min_face_width",
+            "min_face_aspect_ratio",
+            "min_similarity",
+            "min_margin",
+            "voting_window",
+            "required_votes",
+            "face_check_interval",
+            "lost_track_timeout",
+            "yolo_confidence",
+            "yolo_image_size",
+        ]
+
+        if not isinstance(config, dict):
+
+            raise RuntimeError("Recognition configuration must be a dictionary.")
+
+        missing_config = [key for key in required_config if key not in config]
+
+        if missing_config:
+
+            raise RuntimeError(
+                f"Missing recognition configuration: {missing_config}"
+            )
+
+        if int(config["required_votes"]) < 1:
+
+            raise RuntimeError("Required votes must be at least 1.")
+
+        if int(config["voting_window"]) < int(config["required_votes"]):
+
+            raise RuntimeError(
+                "Voting window cannot be smaller than required votes."
+            )
+
+    def _maintain_session(self):
+
+        """Persist a heartbeat and periodically reload enrolled identities."""
+
+        if self.supabase is None or self.session_id is None:
+
+            return
+
+        now_monotonic = time.monotonic()
+
+        if now_monotonic - self.last_heartbeat >= 5.0:
+
+            try:
+
+                now = datetime.now(timezone.utc).isoformat()
+
+                self.supabase.table("recognition_sessions").update({
+                    "last_heartbeat": now,
+                }).eq("id", self.session_id).eq("status", "active").execute()
+
+                self.last_heartbeat = now_monotonic
+
+            except Exception as exc:
+
+                print("[DATABASE WARNING] Session heartbeat failed:", repr(exc))
+
+        if now_monotonic - self.last_gallery_refresh >= 30.0:
+
+            try:
+
+                refreshed_mapping = load_gallery_student_mapping()
+
+                # An empty mapping is meaningful: it can mean all students
+                # were deactivated or their enrollments were removed.
+                self.student_mapping = refreshed_mapping or {}
+
+                refreshed_config = load_recognition_config()
+
+                self._validate_recognition_config(refreshed_config)
+
+                self.config = refreshed_config
+                self.last_gallery_refresh = now_monotonic
+
+                print("[GALLERY] Student embeddings and recognition configuration refreshed.")
+
+            except Exception as exc:
+
+                print("[GALLERY WARNING] Dynamic gallery refresh failed; retaining the previous gallery:", repr(exc))
 
     # ---------------------------------------------------------
     # 2. STOP RECOGNITION SESSION
@@ -235,15 +340,33 @@ class RecognitionEngine:
 
         print("\n[SESSION] Stopping recognition session...")
 
-        self.track_states.clear()
+        if self.supabase is not None and self.session_id:
 
+            try:
+
+                now = datetime.now(timezone.utc).isoformat()
+
+                self.supabase.table("recognition_sessions").update({
+                    "status": "stopped",
+                    "stopped_at": now,
+                    "last_heartbeat": now,
+                }).eq("id", self.session_id).eq("status", "active").execute()
+
+                print("[DATABASE] Recognition session marked as stopped.")
+
+            except Exception as exc:
+
+                print("[DATABASE ERROR] Could not update stopped session:", repr(exc))
+
+        self.track_states.clear()
         self._reset_tracker()
 
         self.session_id = None
-
         self.student_mapping = None
-
         self.config = None
+        self.supabase = None
+        self.last_heartbeat = 0.0
+        self.last_gallery_refresh = 0.0
 
         print("[SESSION] Recognition session stopped.")
 
@@ -760,31 +883,7 @@ class RecognitionEngine:
         }
 
     # ---------------------------------------------------------
-    # 8. SUPABASE HEADERS
-    # ---------------------------------------------------------
-
-    def _supabase_headers(self):
-
-        if (
-            not settings.SUPABASE_URL
-            or not settings.SUPABASE_SERVICE_ROLE_KEY
-        ):
-
-            raise RuntimeError(
-                "Supabase URL or service-role key is not configured."
-            )
-
-        return {
-            "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": (
-                f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}"
-            ),
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        }
-
-    # ---------------------------------------------------------
-    # 9. SAVE OR UPDATE RECOGNITION EVENT
+    # 8. SAVE OR UPDATE RECOGNITION EVENT
     # ---------------------------------------------------------
 
     def _save_recognition_event(
@@ -795,15 +894,15 @@ class RecognitionEngine:
         similarity,
     ):
 
-        """
-        Insert one recognition event when a track is confirmed.
-
-        For subsequent observations, update the existing event.
-
-        Recognition events are stored in Supabase.
-        """
+        """Insert a recognition event once, then update its last_seen."""
 
         if not student_details:
+
+            return False
+
+        if self.supabase is None or not self.session_id:
+
+            print("[DATABASE ERROR] Supabase client or recognition session is missing.")
 
             return False
 
@@ -811,155 +910,73 @@ class RecognitionEngine:
 
         if not student_id:
 
-            print(
-                "[DATABASE ERROR] Student UUID is missing."
-            )
-
-            return False
-
-        if not self.session_id:
-
-            print(
-                "[DATABASE ERROR] Recognition session is missing."
-            )
+            print("[DATABASE ERROR] Student UUID is missing.")
 
             return False
 
         now = datetime.now(timezone.utc).isoformat()
 
-        base_url = settings.SUPABASE_URL.rstrip("/")
-
-        endpoint = (
-            f"{base_url}/rest/v1/recognition_events"
-        )
-
         try:
-
-            headers = self._supabase_headers()
-
-            # -------------------------------------------------
-            # FIRST RECOGNITION: INSERT EVENT
-            # -------------------------------------------------
 
             if state.recognition_event_id is None:
 
                 payload = {
-
                     "student_id": student_id,
-
                     "session_id": self.session_id,
-
                     "track_id": str(track_id),
-
                     "camera_id": None,
-
-                    "first_seen": now,
-
+                    "first_seen": state.first_seen_at or now,
                     "last_seen": now,
-
-                    "similarity_score": float(
-                        similarity or 0.0
-                    ),
-
+                    "similarity_score": float(similarity or 0.0),
                 }
 
-                response = httpx.post(
-                    endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=3.0,
-                )
+                response = self.supabase.table("recognition_events").insert(payload).execute()
+                records = getattr(response, "data", None) or []
 
-                response.raise_for_status()
-
-                records = response.json()
-
-                if not records:
+                if not records or not records[0].get("id"):
 
                     raise RuntimeError(
-                        "Supabase did not return the inserted event."
+                        "Supabase did not return the inserted recognition event ID."
                     )
 
-                state.recognition_event_id = (
-                    records[0]["id"]
-                )
-
+                state.recognition_event_id = records[0]["id"]
                 state.event_student_id = student_id
-
-                state.first_seen_at = now
-
+                state.first_seen_at = payload["first_seen"]
                 state.last_event_update = time.monotonic()
 
-                print(
-                    "\n[DATABASE] RECOGNITION EVENT INSERTED"
-                )
-
-                print(
-                    f"[DATABASE] Student: {student_details['name']}"
-                )
-
-                print(
-                    f"[DATABASE] Roll number: {student_details['roll_no']}"
-                )
-
-                print(
-                    f"[DATABASE] Event ID: {state.recognition_event_id}"
-                )
+                print("\n[DATABASE] RECOGNITION EVENT INSERTED")
+                print(f"[DATABASE] Student: {student_details['name']}")
+                print(f"[DATABASE] Roll number: {student_details['roll_no']}")
+                print(f"[DATABASE] Event ID: {state.recognition_event_id}")
 
                 return True
 
-            # -------------------------------------------------
-            # SUBSEQUENT RECOGNITION: UPDATE EVENT
-            # -------------------------------------------------
-
             payload = {
-
                 "last_seen": now,
-
-                "similarity_score": float(
-                    similarity or 0.0
-                ),
-
+                "similarity_score": float(similarity or 0.0),
             }
-
-            # Update student if the confirmed identity changes.
 
             if state.event_student_id != student_id:
 
                 payload["student_id"] = student_id
 
-                state.event_student_id = student_id
+            self.supabase.table("recognition_events").update(payload).eq(
+                "id", state.recognition_event_id
+            ).execute()
 
-            response = httpx.patch(
-                endpoint,
-                headers=headers,
-                params={
-                    "id": f"eq.{state.recognition_event_id}"
-                },
-                json=payload,
-                timeout=3.0,
-            )
-
-            response.raise_for_status()
-
+            state.event_student_id = student_id
             state.last_event_update = time.monotonic()
 
             print(
-                f"[DATABASE] Recognition event updated: "
-                f"{student_details['name']}"
+                f"[DATABASE] Recognition event updated: {student_details['name']}"
             )
 
             return True
 
         except Exception as exc:
 
-            print(
-                "\n[DATABASE ERROR] Recognition event operation failed:"
-            )
-
-            print(
-                repr(exc)
-            )
+            print("\n[DATABASE ERROR] Recognition event operation failed:")
+            print(repr(exc))
 
             return False
 
@@ -985,6 +1002,8 @@ class RecognitionEngine:
             raise ValueError(
                 "Invalid BGR camera frame."
             )
+
+        self._maintain_session()
 
         start_time = time.perf_counter()
 
@@ -1098,6 +1117,8 @@ class RecognitionEngine:
                         state = TrackState(
 
                             last_seen=current_time,
+
+                            first_seen_at=datetime.now(timezone.utc).isoformat(),
 
                             votes=deque(
                                 maxlen=int(
