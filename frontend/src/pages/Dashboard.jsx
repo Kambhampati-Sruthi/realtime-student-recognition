@@ -1,225 +1,520 @@
 
 import { useCallback, useEffect, useState } from 'react'
-import {
-  Activity,
-  Camera,
-  Clock3,
-  RefreshCw,
-  Server,
-  Users,
-} from 'lucide-react'
-import { getBackendHealth } from '../services/api'
+import { getDashboardSummary } from '../services/api'
 
-const metrics = [
-  {
-    title: 'Registered Students',
-    description: 'Awaiting student API',
-    icon: Users,
-  },
-  {
-    title: "Today's Recognitions",
-    description: 'Awaiting event API',
-    icon: Activity,
-  },
-  {
-    title: 'Active Cameras',
-    description: 'Awaiting camera API',
-    icon: Camera,
-  },
-  {
-    title: 'Recognition Events',
-    description: 'Awaiting event API',
-    icon: Clock3,
-  },
-]
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString()
+}
+
+function formatDate(value) {
+  if (!value) return '—'
+
+  const date = new Date(value)
+
+  if (Number.isNaN(date.getTime())) return '—'
+
+  return date.toLocaleString()
+}
+
+function MetricCard({ title, value, description }) {
+  return (
+    <div className="dashboard-metric-card">
+      <div className="dashboard-metric-title">{title}</div>
+      <div className="dashboard-metric-value">{formatNumber(value)}</div>
+      <div className="dashboard-metric-description">{description}</div>
+    </div>
+  )
+}
+
+function ActivityChart({ activity = [] }) {
+  const maximum = Math.max(
+    1,
+    ...activity.map((item) => Number(item.count || 0))
+  )
+
+  if (!activity.length) {
+    return <div className="dashboard-empty">No activity data available.</div>
+  }
+
+  return (
+    <div className="dashboard-chart">
+      {activity.map((item) => {
+        const count = Number(item.count || 0)
+        const height = Math.max(5, (count / maximum) * 150)
+
+        return (
+          <div className="dashboard-chart-column" key={item.date}>
+            <div className="dashboard-chart-count">{count}</div>
+
+            <div className="dashboard-chart-bar-area">
+              <div
+                className="dashboard-chart-bar"
+                style={{ height: `${height}px` }}
+                title={`${item.date}: ${count} recognitions`}
+              />
+            </div>
+
+            <div className="dashboard-chart-label">
+              {new Date(`${item.date}T00:00:00`).toLocaleDateString(
+                undefined,
+                { weekday: 'short' }
+              )}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function RecentEvents({ events = [] }) {
+  if (!events.length) {
+    return (
+      <div className="dashboard-empty">
+        No recognition events have been recorded yet.
+      </div>
+    )
+  }
+
+  return (
+    <div className="dashboard-table-wrapper">
+      <table className="dashboard-table">
+        <thead>
+          <tr>
+            <th>Student</th>
+            <th>Roll Number</th>
+            <th>Branch</th>
+            <th>Similarity</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {events.map((event) => (
+            <tr key={event.event_id}>
+              <td>{event.student_name}</td>
+              <td>{event.roll_no || '—'}</td>
+              <td>{event.branch || '—'}</td>
+              <td>
+                {event.similarity_score == null
+                  ? '—'
+                  : `${(Number(event.similarity_score) * 100).toFixed(1)}%`}
+              </td>
+              <td>{formatDate(event.last_seen || event.created_at)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
 
 export default function Dashboard() {
-  const [connection, setConnection] = useState('checking')
-  const [health, setHealth] = useState(null)
+  const [dashboard, setDashboard] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
 
-  const checkBackend = useCallback(async () => {
-    setConnection('checking')
-    setError('')
+  const loadDashboard = useCallback(async (showLoader = false) => {
+    if (showLoader) {
+      setLoading(true)
+    } else {
+      setRefreshing(true)
+    }
 
     try {
-      const result = await getBackendHealth()
+      const response = await getDashboardSummary()
 
-      setHealth(result)
-      setConnection('online')
+      if (!response?.success) {
+        throw new Error('The dashboard API returned an invalid response.')
+      }
+
+      setDashboard(response)
+      setError('')
     } catch (err) {
-      setHealth(null)
-      setConnection('offline')
-      setError(err.message || 'Unable to reach backend')
+      console.error('Dashboard loading failed:', err)
+      setError(err.message || 'Unable to load dashboard data.')
+    } finally {
+      setLoading(false)
+      setRefreshing(false)
     }
   }, [])
 
   useEffect(() => {
-    let isMounted = true
+    loadDashboard(true)
 
-    const runHealthCheck = async () => {
-      try {
-        const result = await getBackendHealth()
+    const interval = window.setInterval(() => {
+      loadDashboard(false)
+    }, 30000)
 
-        if (isMounted) {
-          setHealth(result)
-          setConnection('online')
-          setError('')
-        }
-      } catch (err) {
-        if (isMounted) {
-          setHealth(null)
-          setConnection('offline')
-          setError(err.message || 'Unable to reach backend')
-        }
-      }
-    }
+    return () => window.clearInterval(interval)
+  }, [loadDashboard])
 
-    // Schedule initial backend health check asynchronously.
-    const initialCheckId = window.setTimeout(() => {
-      runHealthCheck()
-    }, 0)
-
-    // Automatically check backend every 15 seconds.
-    const intervalId = window.setInterval(() => {
-      runHealthCheck()
-    }, 15000)
-
-    return () => {
-      isMounted = false
-      window.clearTimeout(initialCheckId)
-      window.clearInterval(intervalId)
-    }
-  }, [])
-
-  const statusColor =
-    connection === 'online'
-      ? 'bg-emerald-400'
-      : connection === 'offline'
-        ? 'bg-red-400'
-        : 'bg-amber-400'
+  const metrics = dashboard?.metrics || {}
 
   return (
-    <div className="space-y-8">
-      <section className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+    <main className="dashboard-page">
+      <style>{`
+        .dashboard-page {
+          width: 100%;
+          color: var(--text-primary, #172033);
+        }
+
+        .dashboard-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          margin-bottom: 24px;
+          flex-wrap: wrap;
+        }
+
+        .dashboard-heading {
+          margin: 0;
+          font-size: 26px;
+          font-weight: 700;
+        }
+
+        .dashboard-subtitle {
+          margin-top: 6px;
+          color: var(--text-secondary, #667085);
+          font-size: 14px;
+        }
+
+        .dashboard-refresh-button {
+          padding: 10px 16px;
+          border: 1px solid var(--border-color, #dce1e8);
+          border-radius: 9px;
+          background: var(--surface, #fff);
+          color: inherit;
+          cursor: pointer;
+        }
+
+        .dashboard-refresh-button:disabled {
+          opacity: .6;
+          cursor: wait;
+        }
+
+        .dashboard-metrics-grid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 16px;
+          margin-bottom: 24px;
+        }
+
+        .dashboard-metric-card {
+          padding: 20px;
+          border: 1px solid var(--border-color, #e2e6ec);
+          border-radius: 13px;
+          background: var(--surface, #fff);
+          min-width: 0;
+        }
+
+        .dashboard-metric-title {
+          font-size: 14px;
+          color: var(--text-secondary, #667085);
+        }
+
+        .dashboard-metric-value {
+          margin-top: 13px;
+          font-size: 30px;
+          font-weight: 750;
+          overflow-wrap: anywhere;
+        }
+
+        .dashboard-metric-description {
+          margin-top: 7px;
+          font-size: 12px;
+          color: var(--text-secondary, #667085);
+        }
+
+        .dashboard-content-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1.4fr) minmax(260px, 1fr);
+          gap: 18px;
+          margin-bottom: 22px;
+        }
+
+        .dashboard-panel {
+          min-width: 0;
+          padding: 20px;
+          border: 1px solid var(--border-color, #e2e6ec);
+          border-radius: 13px;
+          background: var(--surface, #fff);
+        }
+
+        .dashboard-panel h2 {
+          margin: 0;
+          font-size: 17px;
+          font-weight: 650;
+        }
+
+        .dashboard-panel-subtitle {
+          margin-top: 6px;
+          color: var(--text-secondary, #667085);
+          font-size: 12px;
+        }
+
+        .dashboard-chart {
+          display: flex;
+          align-items: flex-end;
+          justify-content: space-around;
+          gap: 10px;
+          height: 220px;
+          padding-top: 25px;
+        }
+
+        .dashboard-chart-column {
+          flex: 1;
+          min-width: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 7px;
+        }
+
+        .dashboard-chart-count {
+          font-size: 12px;
+          color: var(--text-secondary, #667085);
+        }
+
+        .dashboard-chart-bar-area {
+          height: 155px;
+          width: 100%;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+        }
+
+        .dashboard-chart-bar {
+          width: min(34px, 75%);
+          min-height: 5px;
+          border-radius: 6px 6px 2px 2px;
+          background: var(--accent-color, #3978d5);
+          transition: height .25s ease;
+        }
+
+        .dashboard-chart-label {
+          font-size: 11px;
+          color: var(--text-secondary, #667085);
+        }
+
+        .dashboard-status-row {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 13px 0;
+          border-bottom: 1px solid var(--border-color, #e2e6ec);
+          font-size: 14px;
+        }
+
+        .dashboard-status-row:last-child {
+          border-bottom: 0;
+        }
+
+        .dashboard-status-value {
+          font-weight: 650;
+          text-align: right;
+        }
+
+        .dashboard-table-wrapper {
+          overflow-x: auto;
+          margin-top: 15px;
+        }
+
+        .dashboard-table {
+          width: 100%;
+          border-collapse: collapse;
+          text-align: left;
+          font-size: 13px;
+          white-space: nowrap;
+        }
+
+        .dashboard-table th,
+        .dashboard-table td {
+          padding: 13px 12px;
+          border-bottom: 1px solid var(--border-color, #e2e6ec);
+        }
+
+        .dashboard-table th {
+          color: var(--text-secondary, #667085);
+          font-weight: 600;
+        }
+
+        .dashboard-empty {
+          padding: 28px 10px;
+          color: var(--text-secondary, #667085);
+          text-align: center;
+          font-size: 14px;
+        }
+
+        .dashboard-error {
+          margin-bottom: 18px;
+          padding: 13px 16px;
+          border: 1px solid #e7b4b4;
+          border-radius: 9px;
+          color: #a12626;
+          background: #fff4f4;
+          font-size: 14px;
+        }
+
+        .dashboard-updated {
+          margin-top: 12px;
+          color: var(--text-secondary, #667085);
+          font-size: 11px;
+        }
+
+        @media (max-width: 1000px) {
+          .dashboard-metrics-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+
+          .dashboard-content-grid {
+            grid-template-columns: 1fr;
+          }
+        }
+
+        @media (max-width: 520px) {
+          .dashboard-metrics-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .dashboard-metric-value {
+            font-size: 26px;
+          }
+
+          .dashboard-panel {
+            padding: 14px;
+          }
+        }
+      `}</style>
+
+      <header className="dashboard-header">
         <div>
-          <p className="text-sm text-blue-400">Overview</p>
-          <h2 className="mt-1 text-2xl font-bold tracking-tight text-white md:text-3xl">
-            Dashboard
-          </h2>
-          <p className="mt-2 text-sm text-slate-400">
-            Monitor student recognition and application activity.
-          </p>
+          <h1 className="dashboard-heading">Dashboard</h1>
+          <div className="dashboard-subtitle">
+            Real-time person recognition system overview
+          </div>
         </div>
 
         <button
-          onClick={checkBackend}
-          disabled={connection === 'checking'}
-          className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-2.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+          className="dashboard-refresh-button"
+          onClick={() => loadDashboard(false)}
+          disabled={refreshing || loading}
         >
-          <RefreshCw
-            size={16}
-            className={connection === 'checking' ? 'animate-spin' : ''}
-          />
-          Refresh status
+          {refreshing ? 'Refreshing...' : 'Refresh data'}
         </button>
-      </section>
+      </header>
 
-      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {metrics.map(({ title, description, icon: Icon }) => (
-          <article
-            key={title}
-            className="rounded-xl border border-slate-800 bg-slate-900 p-5"
-          >
-            <div className="flex items-center justify-between">
-              <p className="text-sm text-slate-400">{title}</p>
-              <div className="rounded-lg bg-blue-500/10 p-2 text-blue-400">
-                <Icon size={19} />
+      {error && (
+        <div className="dashboard-error">
+          {error}
+        </div>
+      )}
+
+      {loading && !dashboard ? (
+        <div className="dashboard-empty">
+          Loading dashboard data from the database...
+        </div>
+      ) : (
+        <>
+          <section className="dashboard-metrics-grid">
+            <MetricCard
+              title="Registered Students"
+              value={metrics.total_students}
+              description={`${formatNumber(metrics.active_students)} active students`}
+            />
+
+            <MetricCard
+              title="Today's Recognitions"
+              value={metrics.today_recognitions}
+              description="Recognition events recorded today"
+            />
+
+            <MetricCard
+              title="Active Camera Sessions"
+              value={metrics.active_cameras}
+              description="Sessions currently marked active"
+            />
+
+            <MetricCard
+              title="Total Recognition Events"
+              value={metrics.total_events}
+              description="Events stored in the database"
+            />
+          </section>
+
+          <section className="dashboard-content-grid">
+            <div className="dashboard-panel">
+              <h2>Recognition Activity</h2>
+              <div className="dashboard-panel-subtitle">
+                Recognition events over the last seven days
+              </div>
+
+              <ActivityChart activity={dashboard?.activity || []} />
+            </div>
+
+            <div className="dashboard-panel">
+              <h2>System Overview</h2>
+              <div className="dashboard-panel-subtitle">
+                Database-backed system information
+              </div>
+
+              <div style={{ marginTop: 18 }}>
+                <div className="dashboard-status-row">
+                  <span>Backend API</span>
+                  <span className="dashboard-status-value">
+                    Connected
+                  </span>
+                </div>
+
+                <div className="dashboard-status-row">
+                  <span>Registered Students</span>
+                  <span className="dashboard-status-value">
+                    {formatNumber(metrics.total_students)}
+                  </span>
+                </div>
+
+                <div className="dashboard-status-row">
+                  <span>Active Students</span>
+                  <span className="dashboard-status-value">
+                    {formatNumber(metrics.active_students)}
+                  </span>
+                </div>
+
+                <div className="dashboard-status-row">
+                  <span>Configured Cameras</span>
+                  <span className="dashboard-status-value">
+                    {formatNumber(metrics.configured_cameras)}
+                  </span>
+                </div>
+
+                <div className="dashboard-status-row">
+                  <span>Active Sessions</span>
+                  <span className="dashboard-status-value">
+                    {formatNumber(metrics.active_cameras)}
+                  </span>
+                </div>
               </div>
             </div>
+          </section>
 
-            <p className="mt-5 text-3xl font-bold text-white">—</p>
-            <p className="mt-2 text-xs text-slate-500">{description}</p>
-          </article>
-        ))}
-      </section>
-
-      <section className="grid gap-5 xl:grid-cols-3">
-        <article className="rounded-xl border border-slate-800 bg-slate-900 p-6 xl:col-span-2">
-          <div className="flex items-center gap-2">
-            <Activity size={19} className="text-blue-400" />
-            <h3 className="font-semibold text-white">
-              Recognition Activity
-            </h3>
-          </div>
-
-          <div className="flex min-h-64 flex-col items-center justify-center text-center">
-            <Activity size={35} className="text-slate-600" />
-            <p className="mt-4 font-medium text-slate-300">
-              Waiting for recognition data
-            </p>
-            <p className="mt-2 max-w-sm text-sm text-slate-500">
-              Recognition charts will display real database events after API integration.
-            </p>
-          </div>
-        </article>
-
-        <article className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-          <div className="flex items-center gap-2">
-            <Server size={19} className="text-blue-400" />
-            <h3 className="font-semibold text-white">System Status</h3>
-          </div>
-
-          <div className="mt-6 space-y-5">
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-sm text-slate-400">
-                FastAPI backend
-              </span>
-              <span className="flex items-center gap-2 text-sm">
-                <span className={`h-2 w-2 rounded-full ${statusColor}`} />
-                {connection === 'online'
-                  ? 'Online'
-                  : connection === 'offline'
-                    ? 'Offline'
-                    : 'Checking'}
-              </span>
+          <section className="dashboard-panel">
+            <h2>Recent Recognition Events</h2>
+            <div className="dashboard-panel-subtitle">
+              Latest recognition records retrieved from Supabase
             </div>
 
-            <div className="border-t border-slate-800 pt-4">
-              <p className="text-xs uppercase tracking-wider text-slate-500">
-                Application
-              </p>
-              <p className="mt-2 text-sm text-slate-200">
-                {health?.application ?? 'Not connected'}
-              </p>
-            </div>
+            <RecentEvents events={dashboard?.recent_events || []} />
 
-            <div className="border-t border-slate-800 pt-4">
-              <p className="text-xs uppercase tracking-wider text-slate-500">
-                Inference device
-              </p>
-              <p className="mt-2 text-sm uppercase text-slate-200">
-                {health?.device ?? 'Unknown'}
-              </p>
+            <div className="dashboard-updated">
+              Last updated: {formatDate(dashboard?.generated_at)}
+              {' · '}Automatic refresh every 30 seconds
             </div>
-
-            <div className="border-t border-slate-800 pt-4">
-              <p className="text-xs uppercase tracking-wider text-slate-500">
-                API status
-              </p>
-              <p className="mt-2 text-sm text-slate-200">
-                {health?.status ?? 'Unavailable'}
-              </p>
-            </div>
-
-            {error && (
-              <p className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-300">
-                {error}
-              </p>
-            )}
-          </div>
-        </article>
-      </section>
-    </div>
+          </section>
+        </>
+      )}
+    </main>
   )
 }

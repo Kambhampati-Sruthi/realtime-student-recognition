@@ -9,9 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from deepface import DeepFace
-from retinaface import RetinaFace
 from ultralytics import YOLO
 
 from app.config import settings
@@ -36,14 +34,14 @@ if not YOLO_PATH.is_absolute():
 @lru_cache(maxsize=1)
 def initialize_ai_models() -> dict[str, Any]:
     """
-    Initialize all AI models once and reuse them.
+    Initialize the application AI models once.
 
     Models:
         1. YOLO11n person detector
         2. RetinaFace face detector
         3. ArcFace facial recognition model
 
-    The application is configured for CPU inference.
+    This application currently uses CPU inference.
     """
 
     if settings.DEVICE.lower() != "cpu":
@@ -53,7 +51,7 @@ def initialize_ai_models() -> dict[str, Any]:
 
     print("\n========== AI MODEL INITIALIZATION ==========")
 
-    # 1. Load YOLO11n.
+    # 1. YOLO11n.
     if not YOLO_PATH.is_file():
         raise FileNotFoundError(
             f"YOLO model not found: {YOLO_PATH}"
@@ -70,8 +68,10 @@ def initialize_ai_models() -> dict[str, Any]:
 
     print("YOLO11n loaded successfully.")
 
-    # 2. Initialize RetinaFace.
+    # 2. RetinaFace.
     print("\nInitializing RetinaFace...")
+
+    from retinaface import RetinaFace
 
     face_detector = RetinaFace.build_model()
 
@@ -82,12 +82,12 @@ def initialize_ai_models() -> dict[str, Any]:
 
     print("RetinaFace initialized successfully.")
 
-    # 3. Initialize ArcFace.
+    # 3. ArcFace.
     print("\nInitializing ArcFace...")
 
     face_recognition_model = DeepFace.build_model(
         model_name="ArcFace",
-        task="facial_recognition"
+        task="facial_recognition",
     )
 
     if face_recognition_model is None:
@@ -115,24 +115,29 @@ def initialize_ai_models() -> dict[str, Any]:
 
 def embed_faces(image_bgr: np.ndarray) -> list:
     """
-    Extract normalized ArcFace embeddings from a BGR image.
+    Extract RetinaFace-detected ArcFace embeddings.
 
-    This follows the original notebook's embed_faces()
-    implementation.
+    Input:
+        Three-channel BGR image.
 
-    Returns:
+    Output:
         List of:
             (embedding, facial_area)
 
         embedding:
-            float32 array of shape (512,)
+            float32 array with shape (512,)
 
         facial_area:
             (x, y, width, height)
+
+    Every returned embedding is L2-normalized.
     """
 
-    if image_bgr is None or not isinstance(image_bgr, np.ndarray):
-        raise ValueError("Invalid input image.")
+    if image_bgr is None:
+        raise ValueError("Input image is None.")
+
+    if not isinstance(image_bgr, np.ndarray):
+        raise ValueError("Input must be a NumPy image array.")
 
     if image_bgr.size == 0:
         raise ValueError("Input image is empty.")
@@ -142,7 +147,7 @@ def embed_faces(image_bgr: np.ndarray) -> list:
             "Expected a three-channel BGR image."
         )
 
-    # Ensure models are initialized before inference.
+    # Ensure the application models are initialized.
     initialize_ai_models()
 
     try:
@@ -151,20 +156,45 @@ def embed_faces(image_bgr: np.ndarray) -> list:
             model_name="ArcFace",
             detector_backend="retinaface",
             enforce_detection=True,
-            align=True
+            align=True,
         )
 
-    except ValueError:
-        # Preserve the original notebook's no-face behavior.
+    except ValueError as exc:
+        error_message = str(exc).lower()
+
+        no_face_indicators = (
+            "face could not be detected",
+            "no face detected",
+            "no face was detected",
+            "cannot detect face",
+            "face detection failed",
+        )
+
+        if any(
+            indicator in error_message
+            for indicator in no_face_indicators
+        ):
+            return []
+
+        # Do not hide unrelated model/input errors.
+        raise
+
+    if not representations:
         return []
 
     output = []
 
     for representation in representations:
+        raw_embedding = representation.get("embedding")
 
-        embedding = np.array(
-            representation["embedding"],
-            dtype=np.float32
+        if raw_embedding is None:
+            raise ValueError(
+                "ArcFace returned a representation without an embedding."
+            )
+
+        embedding = np.asarray(
+            raw_embedding,
+            dtype=np.float32,
         )
 
         if embedding.shape != (512,):
@@ -174,24 +204,28 @@ def embed_faces(image_bgr: np.ndarray) -> list:
 
         if not np.isfinite(embedding).all():
             raise ValueError(
-                "Embedding contains invalid values."
+                "Embedding contains invalid numerical values."
             )
 
-        norm = np.linalg.norm(embedding)
+        norm = float(np.linalg.norm(embedding))
 
-        if norm == 0:
+        if norm <= 1e-12:
             continue
 
-        # Same L2 normalization as the original notebook.
         embedding = embedding / norm
 
-        facial_area = representation["facial_area"]
+        facial_area = representation.get("facial_area")
+
+        if not facial_area:
+            raise ValueError(
+                "ArcFace did not return facial-area information."
+            )
 
         area = (
             int(facial_area["x"]),
             int(facial_area["y"]),
             int(facial_area["w"]),
-            int(facial_area["h"])
+            int(facial_area["h"]),
         )
 
         output.append((embedding, area))
@@ -205,8 +239,8 @@ def embed_faces(image_bgr: np.ndarray) -> list:
 
 def get_ai_model_status() -> dict:
     """
-    Return model initialization status without
-    exposing model weights or internal objects.
+    Return model initialization status without exposing
+    model weights or internal model objects.
     """
 
     models = initialize_ai_models()

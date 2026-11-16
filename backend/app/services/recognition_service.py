@@ -3,9 +3,13 @@ import time
 
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from uuid import uuid4
 
+import httpx
 import numpy as np
+
+from app.config import settings
 
 from app.services.model_service import (
     embed_faces,
@@ -42,6 +46,18 @@ class TrackState:
 
     last_error: str | None = None
 
+    # Database event tracking.
+
+    recognition_event_id: str | None = None
+
+    event_student_id: str | None = None
+
+    first_seen_at: str | None = None
+
+    last_event_update: float = 0.0
+
+    last_event_attempt: float = 0.0
+
 
 class RecognitionEngine:
     """
@@ -63,7 +79,10 @@ class RecognitionEngine:
         Seven enrolled student identities.
 
     Temporal voting:
-        Confirms a student identity across multiple face checks.
+        Confirms identity across multiple face checks.
+
+    Supabase:
+        Automatically stores confirmed recognition events.
     """
 
     def __init__(self):
@@ -92,43 +111,117 @@ class RecognitionEngine:
 
         print("\n========== RECOGNITION SESSION ==========")
 
-        print("[SESSION] Initializing AI models...")
+        try:
 
-        self.models = initialize_ai_models()
+            print("[SESSION] Initializing AI models...")
 
-        print("[SESSION] Loading gallery configuration...")
+            self.models = initialize_ai_models()
 
-        _, _, self.config = load_face_gallery()
+            print("[SESSION] Loading gallery configuration...")
 
-        print("[SESSION] Loading Supabase student mapping...")
+            _, _, self.config = load_face_gallery()
 
-        self.student_mapping = load_gallery_student_mapping()
+            print("[SESSION] Loading Supabase student mapping...")
 
-        active_count = sum(
-            1
-            for item in self.student_mapping.values()
-            if item["is_active"]
-        )
+            self.student_mapping = load_gallery_student_mapping()
 
-        if active_count == 0:
+            if not self.student_mapping:
 
-            raise RuntimeError(
-                "No active students are available for recognition."
+                raise RuntimeError(
+                    "Student gallery mapping is empty."
+                )
+
+            active_count = sum(
+                1
+                for item in self.student_mapping.values()
+                if item.get("is_active", False)
             )
 
-        self.track_states = {}
+            if active_count == 0:
 
-        self.session_id = str(uuid4())
+                raise RuntimeError(
+                    "No active students are available for recognition."
+                )
 
-        self._reset_tracker()
+            required_config = [
+                "min_face_height",
+                "min_face_width",
+                "min_face_aspect_ratio",
+                "min_similarity",
+                "min_margin",
+                "voting_window",
+                "required_votes",
+                "face_check_interval",
+                "lost_track_timeout",
+                "yolo_confidence",
+                "yolo_image_size",
+            ]
 
-        print("[SESSION] Recognition session started.")
+            missing_config = [
+                key
+                for key in required_config
+                if key not in self.config
+            ]
 
-        print(f"[SESSION] Active identities: {active_count}")
+            if missing_config:
 
-        print("=========================================\n")
+                raise RuntimeError(
+                    f"Missing recognition configuration: {missing_config}"
+                )
 
-        return self.session_id
+            if int(self.config["required_votes"]) < 1:
+
+                raise RuntimeError(
+                    "Required votes must be at least 1."
+                )
+
+            if (
+                int(self.config["voting_window"])
+                < int(self.config["required_votes"])
+            ):
+
+                raise RuntimeError(
+                    "Voting window cannot be smaller than required votes."
+                )
+
+            self.track_states = {}
+
+            self._reset_tracker()
+
+            self.session_id = str(uuid4())
+
+            print("[SESSION] Recognition session started.")
+
+            print(
+                f"[SESSION] Active identities: {active_count}"
+            )
+
+            print(
+                f"[SESSION] Voting configuration: "
+                f"{self.config['required_votes']} valid votes "
+                f"within {self.config['voting_window']} checks"
+            )
+
+            print(
+                f"[SESSION] Supabase persistence: "
+                f"{'configured' if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY else 'NOT CONFIGURED'}"
+            )
+
+            print("=========================================\n")
+
+            return self.session_id
+
+        except Exception:
+
+            self.track_states.clear()
+
+            self.session_id = None
+
+            self.student_mapping = None
+
+            self.config = None
+
+            raise
 
     # ---------------------------------------------------------
     # 2. STOP RECOGNITION SESSION
@@ -164,7 +257,11 @@ class RecognitionEngine:
 
             return
 
-        model = self.models["person_detector"]
+        model = self.models.get("person_detector")
+
+        if model is None:
+
+            return
 
         predictor = getattr(
             model,
@@ -202,11 +299,8 @@ class RecognitionEngine:
     def _extract_live_embedding(self, frame, bbox):
 
         """
-        Extract a face embedding from the COMPLETE YOLO
+        Extract a face embedding from the complete YOLO
         person bounding box.
-
-        The original upper-65% crop has been replaced because
-        live testing showed that it truncates the detected face.
 
         Returns:
             embedding,
@@ -219,26 +313,19 @@ class RecognitionEngine:
 
         x1, y1, x2, y2 = map(int, bbox)
 
-        # Keep bounding box inside the frame.
-
         x1 = max(0, min(x1, image_width))
-
         x2 = max(0, min(x2, image_width))
 
         y1 = max(0, min(y1, image_height))
-
         y2 = max(0, min(y2, image_height))
 
         person_width = x2 - x1
-
         person_height = y2 - y1
 
         print(
             f"\n[FACE DEBUG] Person dimensions: "
             f"{person_width} x {person_height}"
         )
-
-        # Minimum person crop validation.
 
         if person_width < 50 or person_height < 90:
 
@@ -248,15 +335,9 @@ class RecognitionEngine:
 
             return None, "person_crop_too_small", None, None
 
-        # -----------------------------------------------------
-        # CORRECTION:
-        # USE THE COMPLETE PERSON BOUNDING BOX.
-        # -----------------------------------------------------
+        # Use the complete person bounding box.
 
-        person_crop = frame[
-            y1:y2,
-            x1:x2
-        ]
+        person_crop = frame[y1:y2, x1:x2]
 
         if person_crop.size == 0:
 
@@ -326,8 +407,6 @@ class RecognitionEngine:
             f"{face_w} x {face_h}"
         )
 
-        # Original configured thresholds.
-
         min_height = int(
             self.config["min_face_height"]
         )
@@ -345,8 +424,6 @@ class RecognitionEngine:
             f"{min_width} x {min_height}"
         )
 
-        # Face height validation.
-
         if face_h < min_height:
 
             print(
@@ -361,8 +438,6 @@ class RecognitionEngine:
                 None
             )
 
-        # Face width validation.
-
         if face_w < min_width:
 
             print(
@@ -376,8 +451,6 @@ class RecognitionEngine:
                 face_dimensions,
                 None
             )
-
-        # Face aspect ratio validation.
 
         aspect_ratio = face_h / max(face_w, 1)
 
@@ -400,12 +473,12 @@ class RecognitionEngine:
                 None
             )
 
-        # Validate embedding.
+        # Validate the embedding.
 
         embedding = np.asarray(
             embedding,
             dtype=np.float32
-        )
+        ).reshape(-1)
 
         if embedding.shape != (512,):
 
@@ -434,6 +507,25 @@ class RecognitionEngine:
                 None
             )
 
+        embedding_norm = np.linalg.norm(embedding)
+
+        if embedding_norm <= 1e-12:
+
+            print(
+                "[FACE DEBUG] Embedding has zero magnitude."
+            )
+
+            return (
+                None,
+                "invalid_embedding_norm",
+                face_dimensions,
+                None
+            )
+
+        # Normalize embedding.
+
+        embedding = embedding / embedding_norm
+
         print(
             "[FACE DEBUG] FACE ACCEPTED"
         )
@@ -459,12 +551,13 @@ class RecognitionEngine:
         if embedding.shape != (512,):
 
             raise ValueError(
-                f"Expected 512-dimensional embedding, got {embedding.shape}"
+                f"Expected 512-dimensional embedding, "
+                f"got {embedding.shape}"
             )
 
         norm = np.linalg.norm(embedding)
 
-        if norm == 0 or not np.isfinite(norm):
+        if norm <= 1e-12 or not np.isfinite(norm):
 
             return None
 
@@ -474,7 +567,7 @@ class RecognitionEngine:
 
         for label, student in self.student_mapping.items():
 
-            if not student["is_active"]:
+            if not student.get("is_active", False):
 
                 continue
 
@@ -482,6 +575,18 @@ class RecognitionEngine:
                 student["embeddings"],
                 dtype=np.float32
             )
+
+            if (
+                reference_embeddings.ndim != 2
+                or reference_embeddings.shape[1] != 512
+                or reference_embeddings.shape[0] == 0
+            ):
+
+                print(
+                    f"[MATCH WARNING] Invalid gallery embeddings: {label}"
+                )
+
+                continue
 
             similarities = (
                 reference_embeddings @ embedding
@@ -526,9 +631,7 @@ class RecognitionEngine:
 
     def _update_identity(self, state, embedding):
 
-        ranked = self._rank_identity(
-            embedding
-        )
+        ranked = self._rank_identity(embedding)
 
         if ranked is None:
 
@@ -586,7 +689,6 @@ class RecognitionEngine:
         else:
 
             best_label = None
-
             best_count = 0
 
         required_votes = int(
@@ -629,7 +731,240 @@ class RecognitionEngine:
             )
 
     # ---------------------------------------------------------
-    # 7. PROCESS CAMERA FRAME
+    # 7. GET STUDENT DETAILS
+    # ---------------------------------------------------------
+
+    def _get_student_details(self, label):
+
+        if label is None or self.student_mapping is None:
+
+            return None
+
+        student = self.student_mapping.get(label)
+
+        if not student:
+
+            return None
+
+        if not student.get("is_active", False):
+
+            return None
+
+        return {
+            "student_id": student["student_id"],
+            "name": student["name"],
+            "roll_no": student["roll_no"],
+            "branch": student["branch"],
+            "role": student["role"],
+            "gallery_label": student["gallery_label"],
+        }
+
+    # ---------------------------------------------------------
+    # 8. SUPABASE HEADERS
+    # ---------------------------------------------------------
+
+    def _supabase_headers(self):
+
+        if (
+            not settings.SUPABASE_URL
+            or not settings.SUPABASE_SERVICE_ROLE_KEY
+        ):
+
+            raise RuntimeError(
+                "Supabase URL or service-role key is not configured."
+            )
+
+        return {
+            "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": (
+                f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}"
+            ),
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+
+    # ---------------------------------------------------------
+    # 9. SAVE OR UPDATE RECOGNITION EVENT
+    # ---------------------------------------------------------
+
+    def _save_recognition_event(
+        self,
+        state,
+        track_id,
+        student_details,
+        similarity,
+    ):
+
+        """
+        Insert one recognition event when a track is confirmed.
+
+        For subsequent observations, update the existing event.
+
+        Recognition events are stored in Supabase.
+        """
+
+        if not student_details:
+
+            return False
+
+        student_id = student_details.get("student_id")
+
+        if not student_id:
+
+            print(
+                "[DATABASE ERROR] Student UUID is missing."
+            )
+
+            return False
+
+        if not self.session_id:
+
+            print(
+                "[DATABASE ERROR] Recognition session is missing."
+            )
+
+            return False
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        base_url = settings.SUPABASE_URL.rstrip("/")
+
+        endpoint = (
+            f"{base_url}/rest/v1/recognition_events"
+        )
+
+        try:
+
+            headers = self._supabase_headers()
+
+            # -------------------------------------------------
+            # FIRST RECOGNITION: INSERT EVENT
+            # -------------------------------------------------
+
+            if state.recognition_event_id is None:
+
+                payload = {
+
+                    "student_id": student_id,
+
+                    "session_id": self.session_id,
+
+                    "track_id": str(track_id),
+
+                    "camera_id": None,
+
+                    "first_seen": now,
+
+                    "last_seen": now,
+
+                    "similarity_score": float(
+                        similarity or 0.0
+                    ),
+
+                }
+
+                response = httpx.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=3.0,
+                )
+
+                response.raise_for_status()
+
+                records = response.json()
+
+                if not records:
+
+                    raise RuntimeError(
+                        "Supabase did not return the inserted event."
+                    )
+
+                state.recognition_event_id = (
+                    records[0]["id"]
+                )
+
+                state.event_student_id = student_id
+
+                state.first_seen_at = now
+
+                state.last_event_update = time.monotonic()
+
+                print(
+                    "\n[DATABASE] RECOGNITION EVENT INSERTED"
+                )
+
+                print(
+                    f"[DATABASE] Student: {student_details['name']}"
+                )
+
+                print(
+                    f"[DATABASE] Roll number: {student_details['roll_no']}"
+                )
+
+                print(
+                    f"[DATABASE] Event ID: {state.recognition_event_id}"
+                )
+
+                return True
+
+            # -------------------------------------------------
+            # SUBSEQUENT RECOGNITION: UPDATE EVENT
+            # -------------------------------------------------
+
+            payload = {
+
+                "last_seen": now,
+
+                "similarity_score": float(
+                    similarity or 0.0
+                ),
+
+            }
+
+            # Update student if the confirmed identity changes.
+
+            if state.event_student_id != student_id:
+
+                payload["student_id"] = student_id
+
+                state.event_student_id = student_id
+
+            response = httpx.patch(
+                endpoint,
+                headers=headers,
+                params={
+                    "id": f"eq.{state.recognition_event_id}"
+                },
+                json=payload,
+                timeout=3.0,
+            )
+
+            response.raise_for_status()
+
+            state.last_event_update = time.monotonic()
+
+            print(
+                f"[DATABASE] Recognition event updated: "
+                f"{student_details['name']}"
+            )
+
+            return True
+
+        except Exception as exc:
+
+            print(
+                "\n[DATABASE ERROR] Recognition event operation failed:"
+            )
+
+            print(
+                repr(exc)
+            )
+
+            return False
+
+    # ---------------------------------------------------------
+    # 10. PROCESS CAMERA FRAME
     # ---------------------------------------------------------
 
     def process_frame(self, frame, session_id):
@@ -684,40 +1019,60 @@ class RecognitionEngine:
 
             if boxes is not None and len(boxes) > 0:
 
-                coordinates = (
-                    boxes.xyxy.cpu().numpy()
-                )
+                coordinates = boxes.xyxy.cpu().numpy()
 
-                track_ids = (
-                    boxes.id.int().cpu().tolist()
-                    if boxes.id is not None
-                    else None
-                )
+                tracker_ids = None
+
+                if boxes.id is not None:
+
+                    tracker_ids = (
+                        boxes.id.int().cpu().tolist()
+                    )
 
                 for index, bbox in enumerate(coordinates):
 
-                    x1, y1, x2, y2 = map(
-                        int,
-                        bbox
-                    )
+                    x1, y1, x2, y2 = map(int, bbox)
 
-                    # Without a tracker ID, temporal voting
-                    # cannot safely maintain identity state.
+                    # Temporal voting requires a stable track ID.
 
                     if (
-                        track_ids is None
-                        or index >= len(track_ids)
+                        tracker_ids is None
+                        or index >= len(tracker_ids)
                     ):
 
                         people.append({
+
                             "track_id": None,
-                            "bbox": [x1, y1, x2, y2],
+
+                            "bbox": [
+                                x1,
+                                y1,
+                                x2,
+                                y2
+                            ],
+
                             "status": "tracking",
-                            "face_status": "no_track_id",
+
                             "student": None,
+
+                            "last_candidate": None,
+
                             "similarity": None,
+
                             "margin": None,
+
                             "votes": 0,
+
+                            "required_votes": int(
+                                self.config["required_votes"]
+                            ),
+
+                            "face_status": "no_track_id",
+
+                            "face_dimensions": None,
+
+                            "face_error": None,
+
                         })
 
                         print(
@@ -727,14 +1082,12 @@ class RecognitionEngine:
                         continue
 
                     track_id = int(
-                        track_ids[index]
+                        tracker_ids[index]
                     )
 
-                    # Create or retrieve track state.
+                    # Retrieve or create track state.
 
-                    state = self.track_states.get(
-                        track_id
-                    )
+                    state = self.track_states.get(track_id)
 
                     if state is None:
 
@@ -743,19 +1096,22 @@ class RecognitionEngine:
                         )
 
                         state = TrackState(
+
                             last_seen=current_time,
+
                             votes=deque(
                                 maxlen=int(
                                     self.config["voting_window"]
                                 )
                             ),
+
                         )
 
                         self.track_states[track_id] = state
 
                     state.last_seen = current_time
 
-                    # Run face recognition at the configured interval.
+                    # Perform face recognition at configured interval.
 
                     face_interval = float(
                         self.config["face_check_interval"]
@@ -772,7 +1128,7 @@ class RecognitionEngine:
                             embedding,
                             face_status,
                             face_dimensions,
-                            face_error
+                            face_error,
                         ) = self._extract_live_embedding(
                             frame,
                             bbox
@@ -797,36 +1153,95 @@ class RecognitionEngine:
 
                             state.votes.append(None)
 
-                    # Resolve confirmed student details.
+                    # Get confirmed student details.
 
-                    student_details = None
+                    student_details = self._get_student_details(
+                        state.confirmed_label
+                    )
 
-                    status = "unknown"
+                    # -------------------------------------------------
+                    # AUTOMATIC SUPABASE PERSISTENCE
+                    # -------------------------------------------------
 
-                    if state.confirmed_label is not None:
+                    if student_details is not None:
 
-                        student = self.student_mapping.get(
-                            state.confirmed_label
+                        should_save_event = (
+
+                            state.recognition_event_id is None
+
+                            and (
+                                current_time - state.last_event_attempt
+                                >= 5.0
+                                or state.last_event_attempt == 0.0
+                            )
+
                         )
 
-                        if student and student["is_active"]:
+                        should_update_event = (
 
-                            student_details = {
-                                "student_id": student["student_id"],
-                                "name": student["name"],
-                                "roll_no": student["roll_no"],
-                                "branch": student["branch"],
-                                "role": student["role"],
-                                "gallery_label": student["gallery_label"],
-                            }
+                            state.recognition_event_id is not None
 
-                            status = "recognized"
+                            and (
+                                current_time - state.last_event_update
+                                >= 2.0
+                            )
+
+                        )
+
+                        if (
+                            should_save_event
+                            or should_update_event
+                        ):
+
+                            state.last_event_attempt = current_time
+
+                            self._save_recognition_event(
+
+                                state=state,
+
+                                track_id=track_id,
+
+                                student_details=student_details,
+
+                                similarity=state.last_similarity,
+
+                            )
+
+                    # Determine recognition status.
+
+                    if student_details is not None:
+
+                        status = "recognized"
 
                     elif state.last_candidate is not None:
 
                         status = "pending"
 
-                    # Include diagnostics in the API response.
+                    elif state.last_face_status == "not_checked":
+
+                        status = "tracking"
+
+                    else:
+
+                        status = "unknown"
+
+                    # Count votes for the best candidate.
+
+                    vote_counts = Counter(
+                        vote
+                        for vote in state.votes
+                        if vote is not None
+                    )
+
+                    candidate_votes = (
+                        vote_counts.get(
+                            state.confirmed_label
+                            or state.last_candidate,
+                            0
+                        )
+                    )
+
+                    # Include information required by frontend.
 
                     people.append({
 
@@ -843,14 +1258,16 @@ class RecognitionEngine:
 
                         "student": student_details,
 
+                        "last_candidate": state.last_candidate,
+
                         "similarity": state.last_similarity,
 
                         "margin": state.last_margin,
 
-                        "votes": sum(
-                            1
-                            for vote in state.votes
-                            if vote is not None
+                        "votes": candidate_votes,
+
+                        "required_votes": int(
+                            self.config["required_votes"]
                         ),
 
                         "face_status": state.last_face_status,
@@ -859,10 +1276,14 @@ class RecognitionEngine:
 
                         "face_error": state.last_error,
 
+                        "recognition_event_id": (
+                            state.recognition_event_id
+                        ),
+
                     })
 
         # -----------------------------------------------------
-        # 8. REMOVE EXPIRED TRACKS
+        # 11. REMOVE EXPIRED TRACKS
         # -----------------------------------------------------
 
         lost_timeout = float(
@@ -888,7 +1309,7 @@ class RecognitionEngine:
             del self.track_states[track_id]
 
         # -----------------------------------------------------
-        # 9. PROCESSING STATISTICS
+        # 12. PROCESSING STATISTICS
         # -----------------------------------------------------
 
         processing_ms = (
@@ -917,6 +1338,8 @@ class RecognitionEngine:
         }
 
 
-# Shared recognition engine instance.
+# ---------------------------------------------------------
+# SHARED RECOGNITION ENGINE INSTANCE
+# ---------------------------------------------------------
 
 recognition_engine = RecognitionEngine()

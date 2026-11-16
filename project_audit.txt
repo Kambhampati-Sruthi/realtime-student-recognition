@@ -1,0 +1,4450 @@
+PROJECT SOURCE AUDIT
+
+========== backend\app\config.py ==========
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+
+    # Application
+    APP_NAME: str = "Real-Time Person Recognition"
+    DEBUG: bool = True
+
+    # Supabase
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
+
+    # Frontend
+    FRONTEND_ORIGIN: str = "http://localhost:5173"
+
+    # AI model
+    YOLO_MODEL_PATH: str = "models/yolo11n.pt"
+    DEVICE: str = "cpu"
+
+    # YOLO configuration
+    YOLO_CONFIDENCE: float = 0.35
+    YOLO_IMAGE_SIZE: int = 640
+
+    # Recognition configuration
+    FACE_CHECK_INTERVAL: float = 1.5
+    LOST_TIMEOUT: float = 7.0
+
+    MIN_SIMILARITY: float = 0.38
+    MIN_MARGIN: float = 0.055
+
+    VOTE_WINDOW: int = 5
+    REQUIRED_VOTES: int = 3
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+
+settings = Settings()
+
+
+========== backend\app\main.py ==========
+FILE NOT FOUND
+
+========== backend\app\services\model_service.py ==========
+
+import os
+
+# Select the TensorFlow backend before importing DeepFace.
+os.environ["DEEPFACE_BACKEND_ENGINE"] = "tensorflow"
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from deepface import DeepFace
+from ultralytics import YOLO
+
+from app.config import settings
+
+
+# ---------------------------------------------------------
+# PATH CONFIGURATION
+# ---------------------------------------------------------
+
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+YOLO_PATH = Path(settings.YOLO_MODEL_PATH)
+
+if not YOLO_PATH.is_absolute():
+    YOLO_PATH = BACKEND_DIR / YOLO_PATH
+
+
+# ---------------------------------------------------------
+# MODEL INITIALIZATION
+# ---------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def initialize_ai_models() -> dict[str, Any]:
+    """
+    Initialize the application AI models once.
+
+    Models:
+        1. YOLO11n person detector
+        2. RetinaFace face detector
+        3. ArcFace facial recognition model
+
+    This application currently uses CPU inference.
+    """
+
+    if settings.DEVICE.lower() != "cpu":
+        raise ValueError(
+            "This project is currently configured for CPU inference."
+        )
+
+    print("\n========== AI MODEL INITIALIZATION ==========")
+
+    # 1. YOLO11n.
+    if not YOLO_PATH.is_file():
+        raise FileNotFoundError(
+            f"YOLO model not found: {YOLO_PATH}"
+        )
+
+    print("\nLoading YOLO11n...")
+
+    person_model = YOLO(str(YOLO_PATH))
+
+    if person_model.names.get(0) != "person":
+        raise RuntimeError(
+            "YOLO model class 0 is not person."
+        )
+
+    print("YOLO11n loaded successfully.")
+
+    # 2. RetinaFace.
+    print("\nInitializing RetinaFace...")
+
+    from retinaface import RetinaFace
+
+    face_detector = RetinaFace.build_model()
+
+    if face_detector is None:
+        raise RuntimeError(
+            "RetinaFace initialization failed."
+        )
+
+    print("RetinaFace initialized successfully.")
+
+    # 3. ArcFace.
+    print("\nInitializing ArcFace...")
+
+    face_recognition_model = DeepFace.build_model(
+        model_name="ArcFace",
+        task="facial_recognition",
+    )
+
+    if face_recognition_model is None:
+        raise RuntimeError(
+            "ArcFace initialization failed."
+        )
+
+    print("ArcFace initialized successfully.")
+
+    print("\nAll AI models initialized successfully.")
+    print("Inference device: CPU")
+    print("=============================================\n")
+
+    return {
+        "person_detector": person_model,
+        "face_detector": face_detector,
+        "face_recognition": face_recognition_model,
+        "device": "cpu",
+    }
+
+
+# ---------------------------------------------------------
+# FACE EMBEDDING EXTRACTION
+# ---------------------------------------------------------
+
+def embed_faces(image_bgr: np.ndarray) -> list:
+    """
+    Extract RetinaFace-detected ArcFace embeddings.
+
+    Input:
+        Three-channel BGR image.
+
+    Output:
+        List of:
+            (embedding, facial_area)
+
+        embedding:
+            float32 array with shape (512,)
+
+        facial_area:
+            (x, y, width, height)
+
+    Every returned embedding is L2-normalized.
+    """
+
+    if image_bgr is None:
+        raise ValueError("Input image is None.")
+
+    if not isinstance(image_bgr, np.ndarray):
+        raise ValueError("Input must be a NumPy image array.")
+
+    if image_bgr.size == 0:
+        raise ValueError("Input image is empty.")
+
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            "Expected a three-channel BGR image."
+        )
+
+    # Ensure the application models are initialized.
+    initialize_ai_models()
+
+    try:
+        representations = DeepFace.represent(
+            img_path=image_bgr,
+            model_name="ArcFace",
+            detector_backend="retinaface",
+            enforce_detection=True,
+            align=True,
+        )
+
+    except ValueError as exc:
+        error_message = str(exc).lower()
+
+        no_face_indicators = (
+            "face could not be detected",
+            "no face detected",
+            "no face was detected",
+            "cannot detect face",
+            "face detection failed",
+        )
+
+        if any(
+            indicator in error_message
+            for indicator in no_face_indicators
+        ):
+            return []
+
+        # Do not hide unrelated model/input errors.
+        raise
+
+    if not representations:
+        return []
+
+    output = []
+
+    for representation in representations:
+        raw_embedding = representation.get("embedding")
+
+        if raw_embedding is None:
+            raise ValueError(
+                "ArcFace returned a representation without an embedding."
+            )
+
+        embedding = np.asarray(
+            raw_embedding,
+            dtype=np.float32,
+        )
+
+        if embedding.shape != (512,):
+            raise ValueError(
+                f"Unexpected embedding shape: {embedding.shape}"
+            )
+
+        if not np.isfinite(embedding).all():
+            raise ValueError(
+                "Embedding contains invalid numerical values."
+            )
+
+        norm = float(np.linalg.norm(embedding))
+
+        if norm <= 1e-12:
+            continue
+
+        embedding = embedding / norm
+
+        facial_area = representation.get("facial_area")
+
+        if not facial_area:
+            raise ValueError(
+                "ArcFace did not return facial-area information."
+            )
+
+        area = (
+            int(facial_area["x"]),
+            int(facial_area["y"]),
+            int(facial_area["w"]),
+            int(facial_area["h"]),
+        )
+
+        output.append((embedding, area))
+
+    return output
+
+
+# ---------------------------------------------------------
+# MODEL STATUS
+# ---------------------------------------------------------
+
+def get_ai_model_status() -> dict:
+    """
+    Return model initialization status without exposing
+    model weights or internal model objects.
+    """
+
+    models = initialize_ai_models()
+
+    return {
+        "status": "loaded",
+        "person_detector": "YOLO11n",
+        "face_detector": "RetinaFace",
+        "face_recognition": "ArcFace",
+        "embedding_dimension": 512,
+        "device": models["device"],
+    }
+
+
+========== backend\app\services\student_service.py ==========
+
+from datetime import datetime, timezone
+from typing import Any
+
+from app.database.supabase_client import get_supabase_client
+
+
+TABLE_NAME = "students"
+
+
+# =========================================================
+# 1. LIST STUDENTS
+# =========================================================
+
+def list_students(
+    limit: int = 100,
+    offset: int = 0,
+    active_only: bool = False,
+) -> list[dict[str, Any]]:
+
+    client = get_supabase_client()
+
+    query = (
+        client.table(TABLE_NAME)
+        .select("*")
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+    )
+
+    if active_only:
+        query = query.eq("is_active", True)
+
+    response = query.execute()
+
+    return response.data or []
+
+
+# =========================================================
+# 2. GET STUDENT BY UUID
+# =========================================================
+
+def get_student_by_id(
+    student_id: str,
+) -> dict[str, Any] | None:
+
+    client = get_supabase_client()
+
+    response = (
+        client.table(TABLE_NAME)
+        .select("*")
+        .eq("id", student_id)
+        .limit(1)
+        .execute()
+    )
+
+    return (
+        response.data[0]
+        if response.data
+        else None
+    )
+
+
+# =========================================================
+# 3. GET STUDENT BY ROLL NUMBER
+# =========================================================
+
+def get_student_by_roll_no(
+    roll_no: str,
+) -> dict[str, Any] | None:
+
+    client = get_supabase_client()
+
+    response = (
+        client.table(TABLE_NAME)
+        .select("*")
+        .eq("roll_no", roll_no.strip())
+        .limit(1)
+        .execute()
+    )
+
+    return (
+        response.data[0]
+        if response.data
+        else None
+    )
+
+
+# =========================================================
+# 4. VALIDATE STUDENT DATA
+# =========================================================
+
+def validate_student_data(
+    student_data: dict[str, Any],
+) -> dict[str, Any]:
+
+    name = str(
+        student_data.get("name") or ""
+    ).strip()
+
+    roll_no = str(
+        student_data.get("roll_no") or ""
+    ).strip()
+
+    branch = str(
+        student_data.get("branch") or ""
+    ).strip()
+
+    role = str(
+        student_data.get("role") or "student"
+    ).strip().lower()
+
+    if not name:
+
+        raise ValueError(
+            "Student name is required."
+        )
+
+    if not roll_no:
+
+        raise ValueError(
+            "Student roll number is required."
+        )
+
+    if not branch:
+
+        raise ValueError(
+            "Student branch is required."
+        )
+
+    if role not in {"student", "admin"}:
+
+        raise ValueError(
+            "Role must be either student or admin."
+        )
+
+    return {
+        **student_data,
+        "name": name,
+        "roll_no": roll_no,
+        "branch": branch,
+        "role": role,
+    }
+
+
+# =========================================================
+# 5. REGISTER STUDENT
+# =========================================================
+
+def create_student(
+    student_data: dict[str, Any],
+) -> dict[str, Any]:
+
+    cleaned_data = validate_student_data(
+        student_data
+    )
+
+    roll_no = cleaned_data["roll_no"]
+
+    existing_student = get_student_by_roll_no(
+        roll_no
+    )
+
+    if existing_student:
+
+        raise ValueError(
+            f"A student with roll number {roll_no} already exists."
+        )
+
+    client = get_supabase_client()
+
+    response = (
+        client.table(TABLE_NAME)
+        .insert(cleaned_data)
+        .execute()
+    )
+
+    if not response.data:
+
+        raise RuntimeError(
+            "Student registration failed."
+        )
+
+    return response.data[0]
+
+
+# =========================================================
+# 6. UPDATE STUDENT DETAILS
+# =========================================================
+
+def update_student(
+    student_id: str,
+    student_data: dict[str, Any],
+) -> dict[str, Any] | None:
+
+    existing_student = get_student_by_id(
+        student_id
+    )
+
+    if not existing_student:
+        return None
+
+    cleaned_data = validate_student_data(
+        student_data
+    )
+
+    roll_no = cleaned_data["roll_no"]
+
+    duplicate = get_student_by_roll_no(
+        roll_no
+    )
+
+    if (
+        duplicate
+        and duplicate["id"] != student_id
+    ):
+
+        raise ValueError(
+            f"Roll number {roll_no} belongs to another student."
+        )
+
+    cleaned_data["updated_at"] = (
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    client = get_supabase_client()
+
+    response = (
+        client.table(TABLE_NAME)
+        .update(cleaned_data)
+        .eq("id", student_id)
+        .execute()
+    )
+
+    return (
+        response.data[0]
+        if response.data
+        else None
+    )
+
+
+# =========================================================
+# 7. ACTIVATE / DEACTIVATE STUDENT
+# =========================================================
+
+def update_student_status(
+    student_id: str,
+    is_active: bool,
+) -> dict[str, Any] | None:
+
+    client = get_supabase_client()
+
+    response = (
+        client.table(TABLE_NAME)
+        .update({
+            "is_active": is_active,
+            "updated_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+        })
+        .eq("id", student_id)
+        .execute()
+    )
+
+    return (
+        response.data[0]
+        if response.data
+        else None
+    )
+
+
+========== backend\app\services\gallery_service.py ==========
+
+import json
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+
+
+# Resolve the backend directory independently of the
+# terminal's current working directory.
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+GALLERY_DIR = BACKEND_DIR / "artifacts" / "gallery"
+
+GALLERY_PATH = GALLERY_DIR / "face_gallery.npz"
+MANIFEST_PATH = GALLERY_DIR / "gallery_manifest.json"
+CONFIG_PATH = GALLERY_DIR / "recognition_config.json"
+
+
+@lru_cache(maxsize=1)
+def load_face_gallery():
+    """
+    Load and validate the existing ArcFace embeddings.
+
+    Returns:
+        dict[str, np.ndarray]:
+            {
+                "Amulya": array of shape (5, 512),
+                "Haritha": array of shape (5, 512),
+                ...
+            }
+    """
+
+    required_files = [
+        GALLERY_PATH,
+        MANIFEST_PATH,
+        CONFIG_PATH,
+    ]
+
+    for file_path in required_files:
+        if not file_path.is_file():
+            raise FileNotFoundError(
+                f"Required gallery file not found: {file_path}"
+            )
+
+    # Read gallery metadata.
+    with MANIFEST_PATH.open("r", encoding="utf-8") as file:
+        manifest = json.load(file)
+
+    # Read recognition configuration.
+    with CONFIG_PATH.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    if manifest.get("gallery_type") != "test_gallery_no_blur":
+        raise ValueError("Unexpected gallery type.")
+
+    identity_count = manifest.get("identity_count")
+    embedding_dimension = manifest.get("embedding_dimension")
+    arrays_metadata = manifest.get("arrays")
+
+    if not isinstance(identity_count, int) or identity_count <= 0:
+        raise ValueError("Invalid identity count in gallery manifest.")
+
+    if not isinstance(embedding_dimension, int) or embedding_dimension <= 0:
+        raise ValueError("Invalid embedding dimension in gallery manifest.")
+
+    if not isinstance(arrays_metadata, dict):
+        raise ValueError("Invalid arrays metadata in gallery manifest.")
+
+    if len(arrays_metadata) != identity_count:
+        raise ValueError("Identity count does not match manifest arrays.")
+
+    gallery = {}
+    seen_labels = set()
+
+    # Load the NPZ archive safely without allowing pickled objects.
+    with np.load(GALLERY_PATH, allow_pickle=False) as archive:
+
+        if set(archive.files) != set(arrays_metadata.keys()):
+            raise ValueError(
+                "NPZ archive keys do not match gallery manifest."
+            )
+
+        for array_key, metadata in arrays_metadata.items():
+
+            gallery_label = metadata.get("gallery_label")
+
+            if not isinstance(gallery_label, str) or not gallery_label.strip():
+                raise ValueError(
+                    f"Invalid gallery label for {array_key}."
+                )
+
+            gallery_label = gallery_label.strip()
+
+            if gallery_label in seen_labels:
+                raise ValueError(
+                    f"Duplicate gallery label: {gallery_label}"
+                )
+
+            seen_labels.add(gallery_label)
+
+            embeddings = np.array(
+                archive[array_key],
+                dtype=np.float32,
+                copy=True,
+            )
+
+            expected_count = metadata.get("embedding_count")
+            expected_dimension = metadata.get("embedding_dimension")
+
+            if embeddings.ndim != 2:
+                raise ValueError(
+                    f"{gallery_label}: embeddings must be a 2D array."
+                )
+
+            if embeddings.shape != (
+                expected_count,
+                expected_dimension,
+            ):
+                raise ValueError(
+                    f"{gallery_label}: embedding shape mismatch. "
+                    f"Found {embeddings.shape}."
+                )
+
+            if embeddings.shape[1] != embedding_dimension:
+                raise ValueError(
+                    f"{gallery_label}: unexpected embedding dimension."
+                )
+
+            if not np.isfinite(embeddings).all():
+                raise ValueError(
+                    f"{gallery_label}: embeddings contain invalid values."
+                )
+
+            gallery[gallery_label] = embeddings
+
+    if len(gallery) != identity_count:
+        raise ValueError("Loaded gallery identity count is incorrect.")
+
+    return gallery, manifest, config
+
+
+def get_gallery_summary():
+    """
+    Return a summary without exposing the embedding values.
+    """
+
+    gallery, manifest, config = load_face_gallery()
+
+    return {
+        "status": "loaded",
+        "gallery_type": manifest["gallery_type"],
+        "identity_count": len(gallery),
+        "total_embeddings": sum(
+            embeddings.shape[0]
+            for embeddings in gallery.values()
+        ),
+        "embedding_dimension": manifest["embedding_dimension"],
+        "identities": list(gallery.keys()),
+        "recognition_model": config.get("recognition_model"),
+        "device": config.get("device"),
+    }
+
+
+========== backend\app\services\gallery_student_service.py ==========
+
+from app.services.gallery_service import load_face_gallery
+from app.services.student_service import list_students
+
+
+def normalize_gallery_label(label):
+    """Normalize labels for case-insensitive matching."""
+    if not isinstance(label, str):
+        return ""
+
+    return label.strip().casefold()
+
+
+def load_gallery_student_mapping():
+    """
+    Associate every saved face-gallery identity with its
+    corresponding Supabase student record.
+
+    Returns:
+        dict:
+            {
+                "Sruthi": {
+                    "student_id": "...",
+                    "name": "Sruthi",
+                    "roll_no": "...",
+                    "branch": "AI & DS",
+                    "role": "Student",
+                    "is_active": True,
+                    "embeddings": numpy_array
+                }
+            }
+
+    Raises:
+        ValueError if a gallery identity cannot be mapped
+        unambiguously to a student.
+    """
+
+    # Load existing face embeddings and metadata.
+    gallery, manifest, config = load_face_gallery()
+
+    # Retrieve current student records from Supabase.
+    students = list_students(limit=500)
+
+    if not students:
+        raise ValueError("No student records found in Supabase.")
+
+    # Build a normalized student lookup using gallery_label.
+    student_lookup = {}
+
+    for student in students:
+        label = normalize_gallery_label(
+            student.get("gallery_label")
+        )
+
+        # Students without a gallery label are not enrolled
+        # in the existing face gallery.
+        if not label:
+            continue
+
+        if label in student_lookup:
+            raise ValueError(
+                f"Duplicate gallery_label found in Supabase: {label}"
+            )
+
+        student_lookup[label] = student
+
+    # Build the final recognition mapping.
+    recognition_mapping = {}
+
+    for gallery_label, embeddings in gallery.items():
+
+        normalized_label = normalize_gallery_label(gallery_label)
+
+        student = student_lookup.get(normalized_label)
+
+        if student is None:
+            raise ValueError(
+                f"No Supabase student found for gallery identity: "
+                f"{gallery_label}"
+            )
+
+        recognition_mapping[gallery_label] = {
+            "student_id": str(student["id"]),
+            "name": student["name"],
+            "roll_no": student["roll_no"],
+            "branch": student.get("branch"),
+            "role": student.get("role"),
+            "is_active": student.get("is_active", False),
+            "gallery_label": gallery_label,
+            "embeddings": embeddings,
+        }
+
+    # Verify that all gallery identities were mapped.
+    if len(recognition_mapping) != len(gallery):
+        raise ValueError(
+            "Gallery-to-student mapping is incomplete."
+        )
+
+    return recognition_mapping
+
+
+def get_gallery_student_summary():
+    """
+    Return safe summary information without exposing embeddings.
+    """
+
+    mapping = load_gallery_student_mapping()
+
+    return {
+        "status": "success",
+        "identity_count": len(mapping),
+        "active_identities": sum(
+            1 for item in mapping.values()
+            if item["is_active"]
+        ),
+        "inactive_identities": sum(
+            1 for item in mapping.values()
+            if not item["is_active"]
+        ),
+        "identities": [
+            {
+                "gallery_label": label,
+                "name": item["name"],
+                "roll_no": item["roll_no"],
+                "branch": item["branch"],
+                "is_active": item["is_active"],
+                "embedding_shape": item["embeddings"].shape,
+            }
+            for label, item in mapping.items()
+        ],
+    }
+
+
+========== backend\app\services\face_enrollment_service.py ==========
+
+import cv2
+import numpy as np
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from app.database.supabase_client import get_supabase_client
+from app.services.model_service import embed_faces
+
+
+BUCKET_NAME = "student-faces"
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+ALLOWED_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+EMBEDDING_DIMENSION = 512
+MODEL_NAME = "ArcFace"
+
+
+class EnrollmentError(Exception):
+    pass
+
+
+def _decode_image(image_bytes: bytes) -> np.ndarray:
+    if not image_bytes:
+        raise EnrollmentError("The uploaded image is empty.")
+
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise EnrollmentError("Image size must not exceed 5 MB.")
+
+    array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise EnrollmentError("The uploaded file is not a valid image.")
+
+    return image
+
+
+def _detect_largest_face(image: np.ndarray):
+    """
+    Uses the existing notebook-compatible embed_faces() function.
+    Expected result: [(embedding, (x, y, w, h)), ...].
+    """
+    detections = embed_faces(image)
+
+    if not detections:
+        raise EnrollmentError(
+            "No face was detected. Upload a clearer, front-facing image."
+        )
+
+    valid = []
+
+    for item in detections:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+
+        embedding, box = item[0], item[1]
+
+        if box is None or len(box) != 4:
+            continue
+
+        x, y, w, h = [int(v) for v in box]
+
+        if w <= 0 or h <= 0:
+            continue
+
+        valid.append((w * h, x, y, w, h))
+
+    if not valid:
+        raise EnrollmentError("A usable face could not be extracted.")
+
+    _, x, y, w, h = max(valid, key=lambda item: item[0])
+    return x, y, w, h
+
+
+def _crop_face(image: np.ndarray, source_type: str) -> np.ndarray:
+    height, width = image.shape[:2]
+    x, y, face_width, face_height = _detect_largest_face(image)
+
+    # Same 0.4 face-width margin used by the ID-card notebook pipeline.
+    margin = int(0.4 * face_width)
+
+    left = max(0, x - margin)
+    top = max(0, y - margin)
+    right = min(width, x + face_width + margin)
+    bottom = min(height, y + face_height + margin)
+
+    face = image[top:bottom, left:right]
+
+    if face.size == 0:
+        raise EnrollmentError("Face cropping failed.")
+
+    # The notebook upscales small ID-card face crops to at least 160 px.
+    minimum_side = min(face.shape[:2])
+
+    if minimum_side < 160:
+        scale = 160.0 / minimum_side
+        new_width = max(1, int(face.shape[1] * scale))
+        new_height = max(1, int(face.shape[0] * scale))
+        face = cv2.resize(
+            face,
+            (new_width, new_height),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    return face
+
+
+def _create_five_variations(face: np.ndarray):
+    """
+    Exactly the tested test_gallery_no_blur variations.
+    Do not add Gaussian blur.
+    """
+    original = face.copy()
+
+    flipped = cv2.flip(original, 1)
+
+    downsampled_width = max(1, int(original.shape[1] * 0.75))
+    downsampled_height = max(1, int(original.shape[0] * 0.75))
+
+    smaller = cv2.resize(
+        original,
+        (downsampled_width, downsampled_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    downsampled = cv2.resize(
+        smaller,
+        (original.shape[1], original.shape[0]),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    darker = np.clip(
+        original.astype(np.float32) * 0.80,
+        0,
+        255,
+    ).astype(np.uint8)
+
+    brighter = np.clip(
+        original.astype(np.float32) * 1.20,
+        0,
+        255,
+    ).astype(np.uint8)
+
+    return [
+        original,
+        flipped,
+        downsampled,
+        darker,
+        brighter,
+    ]
+
+
+def _extract_embedding(image: np.ndarray) -> list[float]:
+    detections = embed_faces(image)
+
+    if not detections:
+        raise EnrollmentError(
+            "ArcFace could not generate an embedding for one of the image variations."
+        )
+
+    embedding = np.asarray(detections[0][0], dtype=np.float32).reshape(-1)
+
+    if embedding.size != EMBEDDING_DIMENSION:
+        raise EnrollmentError(
+            f"Expected a 512-dimensional embedding, received {embedding.size}."
+        )
+
+    if not np.all(np.isfinite(embedding)):
+        raise EnrollmentError("The generated embedding contains invalid values.")
+
+    norm = float(np.linalg.norm(embedding))
+
+    if norm <= 1e-12:
+        raise EnrollmentError("The generated embedding has zero magnitude.")
+
+    embedding = embedding / norm
+    return embedding.astype(np.float32).tolist()
+
+
+def _get_or_create_student(
+    supabase,
+    roll_no: str,
+    name: str,
+    branch: str,
+    year_of_study: int | None,
+):
+    result = (
+        supabase.table("students")
+        .select("*")
+        .eq("roll_no", roll_no)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data:
+        student = result.data[0]
+
+        update_data = {
+            "name": name,
+            "branch": branch,
+            "is_active": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if year_of_study is not None:
+            update_data["year_of_study"] = year_of_study
+
+        updated = (
+            supabase.table("students")
+            .update(update_data)
+            .eq("id", student["id"])
+            .execute()
+        )
+
+        if not updated.data:
+            raise EnrollmentError("Unable to update the existing student record.")
+
+        return updated.data[0], False
+
+    insert_data = {
+        "roll_no": roll_no,
+        "name": name,
+        "branch": branch,
+        "role": "student",
+        "is_active": True,
+        "enrollment_status": "pending",
+    }
+
+    if year_of_study is not None:
+        insert_data["year_of_study"] = year_of_study
+
+    created = (
+        supabase.table("students")
+        .insert(insert_data)
+        .execute()
+    )
+
+    if not created.data:
+        raise EnrollmentError("Unable to create the student record.")
+
+    return created.data[0], True
+
+
+def enroll_student(
+    *,
+    roll_no: str,
+    name: str,
+    branch: str,
+    image_bytes: bytes,
+    mime_type: str,
+    source_type: str,
+    year_of_study: int | None = None,
+):
+    roll_no = roll_no.strip()
+    name = name.strip()
+    branch = branch.strip()
+
+    if not roll_no or not name or not branch:
+        raise EnrollmentError("Roll number, name and branch are required.")
+
+    if source_type not in {"face", "id_card"}:
+        raise EnrollmentError("source_type must be 'face' or 'id_card'.")
+
+    if mime_type not in ALLOWED_MIME_TYPES:
+        raise EnrollmentError("Only JPEG, PNG and WebP images are supported.")
+
+    if year_of_study is not None and year_of_study not in (1, 2, 3, 4):
+        raise EnrollmentError("Year of study must be between 1 and 4.")
+
+    image = _decode_image(image_bytes)
+    face = _crop_face(image, source_type)
+    variations = _create_five_variations(face)
+
+    # Generate every embedding before changing database enrollment status.
+    embeddings = [
+        _extract_embedding(variation)
+        for variation in variations
+    ]
+
+    if len(embeddings) != 5:
+        raise EnrollmentError("Exactly five embeddings are required.")
+
+    supabase = get_supabase_client()
+    student, was_created = _get_or_create_student(
+        supabase,
+        roll_no,
+        name,
+        branch,
+        year_of_study,
+    )
+
+    student_id = student["id"]
+    image_id = str(uuid.uuid4())
+    storage_path = f"{student_id}/{image_id}.jpg"
+
+    uploaded = False
+    image_row_created = False
+    embedding_rows_created = False
+
+    try:
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+        )
+
+        if not success:
+            raise EnrollmentError("Unable to encode the uploaded image.")
+
+        supabase.storage.from_(BUCKET_NAME).upload(
+            storage_path,
+            encoded.tobytes(),
+            {
+                "content-type": "image/jpeg",
+                "upsert": "false",
+            },
+        )
+        uploaded = True
+
+        image_record = {
+            "id": image_id,
+            "student_id": student_id,
+            "storage_path": storage_path,
+            "source_type": source_type,
+        }
+
+        image_result = (
+            supabase.table("student_face_images")
+            .insert(image_record)
+            .execute()
+        )
+
+        if not image_result.data:
+            raise EnrollmentError("Unable to save face-image metadata.")
+
+        image_row_created = True
+
+        embedding_records = []
+
+        for index, embedding in enumerate(embeddings, start=1):
+            embedding_records.append({
+                "student_id": student_id,
+                "image_id": image_id,
+                "variation_index": index,
+                "embedding": embedding,
+                "model_name": MODEL_NAME,
+                "embedding_dimension": EMBEDDING_DIMENSION,
+            })
+
+        embedding_result = (
+            supabase.table("student_face_embeddings")
+            .insert(embedding_records)
+            .execute()
+        )
+
+        if len(embedding_result.data or []) != 5:
+            raise EnrollmentError("All five embeddings were not saved.")
+
+        embedding_rows_created = True
+
+        enrolled_at = datetime.now(timezone.utc).isoformat()
+
+        status_result = (
+            supabase.table("students")
+            .update({
+                "enrollment_status": "enrolled",
+                "face_enrolled_at": enrolled_at,
+                "updated_at": enrolled_at,
+            })
+            .eq("id", student_id)
+            .execute()
+        )
+
+        if not status_result.data:
+            raise EnrollmentError("Unable to finalize student enrollment.")
+
+        return {
+            "success": True,
+            "message": "Student enrolled successfully.",
+            "student_id": student_id,
+            "roll_no": roll_no,
+            "name": name,
+            "source_type": source_type,
+            "embedding_count": 5,
+            "embedding_dimension": EMBEDDING_DIMENSION,
+            "enrollment_status": "enrolled",
+        }
+
+    except Exception as exc:
+        # Best-effort cleanup. Do not mark an existing enrolled student as failed.
+        try:
+            if embedding_rows_created or image_row_created:
+                supabase.table("student_face_embeddings").delete().eq(
+                    "image_id", image_id
+                ).execute()
+        except Exception:
+            pass
+
+        try:
+            if image_row_created:
+                supabase.table("student_face_images").delete().eq(
+                    "id", image_id
+                ).execute()
+        except Exception:
+            pass
+
+        try:
+            if uploaded:
+                supabase.storage.from_(BUCKET_NAME).remove([storage_path])
+        except Exception:
+            pass
+
+        if was_created:
+            try:
+                supabase.table("students").delete().eq(
+                    "id", student_id
+                ).execute()
+            except Exception:
+                pass
+
+        if isinstance(exc, EnrollmentError):
+            raise
+
+        raise EnrollmentError(
+            f"Enrollment could not be completed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+========== backend\app\services\recognition_service.py ==========
+
+import time
+
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from uuid import uuid4
+
+import httpx
+import numpy as np
+
+from app.config import settings
+
+from app.services.model_service import (
+    embed_faces,
+    initialize_ai_models,
+)
+
+from app.services.gallery_service import load_face_gallery
+
+from app.services.gallery_student_service import (
+    load_gallery_student_mapping,
+)
+
+
+@dataclass
+class TrackState:
+
+    last_seen: float
+
+    last_face_check: float = 0.0
+
+    votes: deque = field(default_factory=deque)
+
+    confirmed_label: str | None = None
+
+    last_candidate: str | None = None
+
+    last_similarity: float | None = None
+
+    last_margin: float | None = None
+
+    last_face_status: str = "not_checked"
+
+    last_face_dimensions: list | None = None
+
+    last_error: str | None = None
+
+    # Database event tracking.
+
+    recognition_event_id: str | None = None
+
+    event_student_id: str | None = None
+
+    first_seen_at: str | None = None
+
+    last_event_update: float = 0.0
+
+    last_event_attempt: float = 0.0
+
+
+class RecognitionEngine:
+    """
+    CPU-based real-time student recognition engine.
+
+    YOLO11n:
+        Person detection.
+
+    ByteTrack:
+        Persistent person tracking.
+
+    RetinaFace:
+        Face detection.
+
+    ArcFace:
+        512-dimensional face embeddings.
+
+    Existing gallery:
+        Seven enrolled student identities.
+
+    Temporal voting:
+        Confirms identity across multiple face checks.
+
+    Supabase:
+        Automatically stores confirmed recognition events.
+    """
+
+    def __init__(self):
+
+        self.session_id = None
+
+        self.models = None
+
+        self.student_mapping = None
+
+        self.config = None
+
+        self.track_states = {}
+
+    # ---------------------------------------------------------
+    # 1. START RECOGNITION SESSION
+    # ---------------------------------------------------------
+
+    def start_session(self):
+
+        if self.session_id is not None:
+
+            raise RuntimeError(
+                "A recognition session is already active."
+            )
+
+        print("\n========== RECOGNITION SESSION ==========")
+
+        try:
+
+            print("[SESSION] Initializing AI models...")
+
+            self.models = initialize_ai_models()
+
+            print("[SESSION] Loading gallery configuration...")
+
+            _, _, self.config = load_face_gallery()
+
+            print("[SESSION] Loading Supabase student mapping...")
+
+            self.student_mapping = load_gallery_student_mapping()
+
+            if not self.student_mapping:
+
+                raise RuntimeError(
+                    "Student gallery mapping is empty."
+                )
+
+            active_count = sum(
+                1
+                for item in self.student_mapping.values()
+                if item.get("is_active", False)
+            )
+
+            if active_count == 0:
+
+                raise RuntimeError(
+                    "No active students are available for recognition."
+                )
+
+            required_config = [
+                "min_face_height",
+                "min_face_width",
+                "min_face_aspect_ratio",
+                "min_similarity",
+                "min_margin",
+                "voting_window",
+                "required_votes",
+                "face_check_interval",
+                "lost_track_timeout",
+                "yolo_confidence",
+                "yolo_image_size",
+            ]
+
+            missing_config = [
+                key
+                for key in required_config
+                if key not in self.config
+            ]
+
+            if missing_config:
+
+                raise RuntimeError(
+                    f"Missing recognition configuration: {missing_config}"
+                )
+
+            if int(self.config["required_votes"]) < 1:
+
+                raise RuntimeError(
+                    "Required votes must be at least 1."
+                )
+
+            if (
+                int(self.config["voting_window"])
+                < int(self.config["required_votes"])
+            ):
+
+                raise RuntimeError(
+                    "Voting window cannot be smaller than required votes."
+                )
+
+            self.track_states = {}
+
+            self._reset_tracker()
+
+            self.session_id = str(uuid4())
+
+            print("[SESSION] Recognition session started.")
+
+            print(
+                f"[SESSION] Active identities: {active_count}"
+            )
+
+            print(
+                f"[SESSION] Voting configuration: "
+                f"{self.config['required_votes']} valid votes "
+                f"within {self.config['voting_window']} checks"
+            )
+
+            print(
+                f"[SESSION] Supabase persistence: "
+                f"{'configured' if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY else 'NOT CONFIGURED'}"
+            )
+
+            print("=========================================\n")
+
+            return self.session_id
+
+        except Exception:
+
+            self.track_states.clear()
+
+            self.session_id = None
+
+            self.student_mapping = None
+
+            self.config = None
+
+            raise
+
+    # ---------------------------------------------------------
+    # 2. STOP RECOGNITION SESSION
+    # ---------------------------------------------------------
+
+    def stop_session(self, session_id):
+
+        if session_id != self.session_id:
+
+            return
+
+        print("\n[SESSION] Stopping recognition session...")
+
+        self.track_states.clear()
+
+        self._reset_tracker()
+
+        self.session_id = None
+
+        self.student_mapping = None
+
+        self.config = None
+
+        print("[SESSION] Recognition session stopped.")
+
+    # ---------------------------------------------------------
+    # 3. RESET BYTETRACK
+    # ---------------------------------------------------------
+
+    def _reset_tracker(self):
+
+        if not self.models:
+
+            return
+
+        model = self.models.get("person_detector")
+
+        if model is None:
+
+            return
+
+        predictor = getattr(
+            model,
+            "predictor",
+            None
+        )
+
+        if predictor is None:
+
+            return
+
+        trackers = getattr(
+            predictor,
+            "trackers",
+            []
+        )
+
+        for tracker in trackers:
+
+            try:
+
+                tracker.reset()
+
+            except Exception as exc:
+
+                print(
+                    "[TRACKER] Reset warning:",
+                    repr(exc)
+                )
+
+    # ---------------------------------------------------------
+    # 4. EXTRACT LIVE FACE EMBEDDING
+    # ---------------------------------------------------------
+
+    def _extract_live_embedding(self, frame, bbox):
+
+        """
+        Extract a face embedding from the complete YOLO
+        person bounding box.
+
+        Returns:
+            embedding,
+            diagnostic_status,
+            face_dimensions,
+            error
+        """
+
+        image_height, image_width = frame.shape[:2]
+
+        x1, y1, x2, y2 = map(int, bbox)
+
+        x1 = max(0, min(x1, image_width))
+        x2 = max(0, min(x2, image_width))
+
+        y1 = max(0, min(y1, image_height))
+        y2 = max(0, min(y2, image_height))
+
+        person_width = x2 - x1
+        person_height = y2 - y1
+
+        print(
+            f"\n[FACE DEBUG] Person dimensions: "
+            f"{person_width} x {person_height}"
+        )
+
+        if person_width < 50 or person_height < 90:
+
+            print(
+                "[FACE DEBUG] Rejected: Person crop too small."
+            )
+
+            return None, "person_crop_too_small", None, None
+
+        # Use the complete person bounding box.
+
+        person_crop = frame[y1:y2, x1:x2]
+
+        if person_crop.size == 0:
+
+            print(
+                "[FACE DEBUG] Rejected: Empty person crop."
+            )
+
+            return None, "empty_person_crop", None, None
+
+        print(
+            f"[FACE DEBUG] Complete person crop: "
+            f"{person_crop.shape[1]} x {person_crop.shape[0]}"
+        )
+
+        # RetinaFace detection and ArcFace embedding.
+
+        try:
+
+            faces = embed_faces(person_crop)
+
+        except Exception as exc:
+
+            error_message = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            print(
+                "[FACE DEBUG] DeepFace processing error:",
+                error_message
+            )
+
+            return (
+                None,
+                "embedding_error",
+                None,
+                error_message
+            )
+
+        if not faces:
+
+            print(
+                "[FACE DEBUG] No face detected by RetinaFace."
+            )
+
+            return None, "no_face_detected", None, None
+
+        print(
+            f"[FACE DEBUG] Faces detected: {len(faces)}"
+        )
+
+        # Select the largest detected face.
+
+        embedding, face_area = max(
+            faces,
+            key=lambda item: item[1][2] * item[1][3]
+        )
+
+        face_x, face_y, face_w, face_h = face_area
+
+        face_dimensions = [
+            int(face_w),
+            int(face_h)
+        ]
+
+        print(
+            f"[FACE DEBUG] Largest face: "
+            f"{face_w} x {face_h}"
+        )
+
+        min_height = int(
+            self.config["min_face_height"]
+        )
+
+        min_width = int(
+            self.config["min_face_width"]
+        )
+
+        min_ratio = float(
+            self.config["min_face_aspect_ratio"]
+        )
+
+        print(
+            f"[FACE DEBUG] Required face dimensions: "
+            f"{min_width} x {min_height}"
+        )
+
+        if face_h < min_height:
+
+            print(
+                f"[FACE DEBUG] Rejected: "
+                f"Face height {face_h} < {min_height}"
+            )
+
+            return (
+                None,
+                "face_too_short",
+                face_dimensions,
+                None
+            )
+
+        if face_w < min_width:
+
+            print(
+                f"[FACE DEBUG] Rejected: "
+                f"Face width {face_w} < {min_width}"
+            )
+
+            return (
+                None,
+                "face_too_narrow",
+                face_dimensions,
+                None
+            )
+
+        aspect_ratio = face_h / max(face_w, 1)
+
+        print(
+            f"[FACE DEBUG] Aspect ratio: "
+            f"{aspect_ratio:.3f}"
+        )
+
+        if aspect_ratio < min_ratio:
+
+            print(
+                f"[FACE DEBUG] Rejected: "
+                f"Aspect ratio {aspect_ratio:.3f} < {min_ratio}"
+            )
+
+            return (
+                None,
+                "invalid_face_aspect_ratio",
+                face_dimensions,
+                None
+            )
+
+        # Validate the embedding.
+
+        embedding = np.asarray(
+            embedding,
+            dtype=np.float32
+        ).reshape(-1)
+
+        if embedding.shape != (512,):
+
+            print(
+                "[FACE DEBUG] Invalid embedding shape:",
+                embedding.shape
+            )
+
+            return (
+                None,
+                "invalid_embedding_shape",
+                face_dimensions,
+                None
+            )
+
+        if not np.isfinite(embedding).all():
+
+            print(
+                "[FACE DEBUG] Embedding contains invalid values."
+            )
+
+            return (
+                None,
+                "invalid_embedding",
+                face_dimensions,
+                None
+            )
+
+        embedding_norm = np.linalg.norm(embedding)
+
+        if embedding_norm <= 1e-12:
+
+            print(
+                "[FACE DEBUG] Embedding has zero magnitude."
+            )
+
+            return (
+                None,
+                "invalid_embedding_norm",
+                face_dimensions,
+                None
+            )
+
+        # Normalize embedding.
+
+        embedding = embedding / embedding_norm
+
+        print(
+            "[FACE DEBUG] FACE ACCEPTED"
+        )
+
+        return (
+            embedding,
+            "accepted",
+            face_dimensions,
+            None
+        )
+
+    # ---------------------------------------------------------
+    # 5. RANK STUDENT IDENTITY
+    # ---------------------------------------------------------
+
+    def _rank_identity(self, embedding):
+
+        embedding = np.asarray(
+            embedding,
+            dtype=np.float32
+        ).reshape(-1)
+
+        if embedding.shape != (512,):
+
+            raise ValueError(
+                f"Expected 512-dimensional embedding, "
+                f"got {embedding.shape}"
+            )
+
+        norm = np.linalg.norm(embedding)
+
+        if norm <= 1e-12 or not np.isfinite(norm):
+
+            return None
+
+        embedding = embedding / norm
+
+        scores = []
+
+        for label, student in self.student_mapping.items():
+
+            if not student.get("is_active", False):
+
+                continue
+
+            reference_embeddings = np.asarray(
+                student["embeddings"],
+                dtype=np.float32
+            )
+
+            if (
+                reference_embeddings.ndim != 2
+                or reference_embeddings.shape[1] != 512
+                or reference_embeddings.shape[0] == 0
+            ):
+
+                print(
+                    f"[MATCH WARNING] Invalid gallery embeddings: {label}"
+                )
+
+                continue
+
+            similarities = (
+                reference_embeddings @ embedding
+            )
+
+            score = float(
+                np.max(similarities)
+            )
+
+            scores.append(
+                (label, score)
+            )
+
+        if not scores:
+
+            return None
+
+        scores.sort(
+            key=lambda item: item[1],
+            reverse=True
+        )
+
+        top_label, top_score = scores[0]
+
+        second_score = (
+            scores[1][1]
+            if len(scores) > 1
+            else 0.0
+        )
+
+        margin = top_score - second_score
+
+        return {
+            "label": top_label,
+            "similarity": top_score,
+            "margin": margin,
+        }
+
+    # ---------------------------------------------------------
+    # 6. TEMPORAL IDENTITY VOTING
+    # ---------------------------------------------------------
+
+    def _update_identity(self, state, embedding):
+
+        ranked = self._rank_identity(embedding)
+
+        if ranked is None:
+
+            state.votes.append(None)
+
+            state.last_candidate = None
+
+            return
+
+        similarity = ranked["similarity"]
+
+        margin = ranked["margin"]
+
+        state.last_similarity = similarity
+
+        state.last_margin = margin
+
+        min_similarity = float(
+            self.config["min_similarity"]
+        )
+
+        min_margin = float(
+            self.config["min_margin"]
+        )
+
+        valid_match = (
+            similarity >= min_similarity
+            and margin >= min_margin
+        )
+
+        candidate = (
+            ranked["label"]
+            if valid_match
+            else None
+        )
+
+        state.votes.append(candidate)
+
+        state.last_candidate = candidate
+
+        valid_votes = [
+            vote
+            for vote in state.votes
+            if vote is not None
+        ]
+
+        vote_counts = Counter(valid_votes)
+
+        if vote_counts:
+
+            best_label, best_count = (
+                vote_counts.most_common(1)[0]
+            )
+
+        else:
+
+            best_label = None
+            best_count = 0
+
+        required_votes = int(
+            self.config["required_votes"]
+        )
+
+        print(
+            f"[MATCH DEBUG] Candidate: {candidate}"
+        )
+
+        print(
+            f"[MATCH DEBUG] Similarity: {similarity:.4f}"
+        )
+
+        print(
+            f"[MATCH DEBUG] Margin: {margin:.4f}"
+        )
+
+        print(
+            f"[MATCH DEBUG] Valid votes: "
+            f"{best_count}/{required_votes}"
+        )
+
+        if not valid_match:
+
+            print(
+                "[MATCH DEBUG] Rejected by similarity or margin."
+            )
+
+        if (
+            best_label is not None
+            and best_count >= required_votes
+        ):
+
+            state.confirmed_label = best_label
+
+            print(
+                f"[MATCH DEBUG] IDENTITY CONFIRMED: "
+                f"{best_label}"
+            )
+
+    # ---------------------------------------------------------
+    # 7. GET STUDENT DETAILS
+    # ---------------------------------------------------------
+
+    def _get_student_details(self, label):
+
+        if label is None or self.student_mapping is None:
+
+            return None
+
+        student = self.student_mapping.get(label)
+
+        if not student:
+
+            return None
+
+        if not student.get("is_active", False):
+
+            return None
+
+        return {
+            "student_id": student["student_id"],
+            "name": student["name"],
+            "roll_no": student["roll_no"],
+            "branch": student["branch"],
+            "role": student["role"],
+            "gallery_label": student["gallery_label"],
+        }
+
+    # ---------------------------------------------------------
+    # 8. SUPABASE HEADERS
+    # ---------------------------------------------------------
+
+    def _supabase_headers(self):
+
+        if (
+            not settings.SUPABASE_URL
+            or not settings.SUPABASE_SERVICE_ROLE_KEY
+        ):
+
+            raise RuntimeError(
+                "Supabase URL or service-role key is not configured."
+            )
+
+        return {
+            "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": (
+                f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}"
+            ),
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+
+    # ---------------------------------------------------------
+    # 9. SAVE OR UPDATE RECOGNITION EVENT
+    # ---------------------------------------------------------
+
+    def _save_recognition_event(
+        self,
+        state,
+        track_id,
+        student_details,
+        similarity,
+    ):
+
+        """
+        Insert one recognition event when a track is confirmed.
+
+        For subsequent observations, update the existing event.
+
+        Recognition events are stored in Supabase.
+        """
+
+        if not student_details:
+
+            return False
+
+        student_id = student_details.get("student_id")
+
+        if not student_id:
+
+            print(
+                "[DATABASE ERROR] Student UUID is missing."
+            )
+
+            return False
+
+        if not self.session_id:
+
+            print(
+                "[DATABASE ERROR] Recognition session is missing."
+            )
+
+            return False
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        base_url = settings.SUPABASE_URL.rstrip("/")
+
+        endpoint = (
+            f"{base_url}/rest/v1/recognition_events"
+        )
+
+        try:
+
+            headers = self._supabase_headers()
+
+            # -------------------------------------------------
+            # FIRST RECOGNITION: INSERT EVENT
+            # -------------------------------------------------
+
+            if state.recognition_event_id is None:
+
+                payload = {
+
+                    "student_id": student_id,
+
+                    "session_id": self.session_id,
+
+                    "track_id": str(track_id),
+
+                    "camera_id": None,
+
+                    "first_seen": now,
+
+                    "last_seen": now,
+
+                    "similarity_score": float(
+                        similarity or 0.0
+                    ),
+
+                }
+
+                response = httpx.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=3.0,
+                )
+
+                response.raise_for_status()
+
+                records = response.json()
+
+                if not records:
+
+                    raise RuntimeError(
+                        "Supabase did not return the inserted event."
+                    )
+
+                state.recognition_event_id = (
+                    records[0]["id"]
+                )
+
+                state.event_student_id = student_id
+
+                state.first_seen_at = now
+
+                state.last_event_update = time.monotonic()
+
+                print(
+                    "\n[DATABASE] RECOGNITION EVENT INSERTED"
+                )
+
+                print(
+                    f"[DATABASE] Student: {student_details['name']}"
+                )
+
+                print(
+                    f"[DATABASE] Roll number: {student_details['roll_no']}"
+                )
+
+                print(
+                    f"[DATABASE] Event ID: {state.recognition_event_id}"
+                )
+
+                return True
+
+            # -------------------------------------------------
+            # SUBSEQUENT RECOGNITION: UPDATE EVENT
+            # -------------------------------------------------
+
+            payload = {
+
+                "last_seen": now,
+
+                "similarity_score": float(
+                    similarity or 0.0
+                ),
+
+            }
+
+            # Update student if the confirmed identity changes.
+
+            if state.event_student_id != student_id:
+
+                payload["student_id"] = student_id
+
+                state.event_student_id = student_id
+
+            response = httpx.patch(
+                endpoint,
+                headers=headers,
+                params={
+                    "id": f"eq.{state.recognition_event_id}"
+                },
+                json=payload,
+                timeout=3.0,
+            )
+
+            response.raise_for_status()
+
+            state.last_event_update = time.monotonic()
+
+            print(
+                f"[DATABASE] Recognition event updated: "
+                f"{student_details['name']}"
+            )
+
+            return True
+
+        except Exception as exc:
+
+            print(
+                "\n[DATABASE ERROR] Recognition event operation failed:"
+            )
+
+            print(
+                repr(exc)
+            )
+
+            return False
+
+    # ---------------------------------------------------------
+    # 10. PROCESS CAMERA FRAME
+    # ---------------------------------------------------------
+
+    def process_frame(self, frame, session_id):
+
+        if session_id != self.session_id:
+
+            raise RuntimeError(
+                "Invalid or expired recognition session."
+            )
+
+        if (
+            not isinstance(frame, np.ndarray)
+            or frame.size == 0
+            or frame.ndim != 3
+            or frame.shape[2] != 3
+        ):
+
+            raise ValueError(
+                "Invalid BGR camera frame."
+            )
+
+        start_time = time.perf_counter()
+
+        current_time = time.monotonic()
+
+        model = self.models["person_detector"]
+
+        # YOLO11 person detection and ByteTrack.
+
+        results = model.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            classes=[0],
+            conf=float(
+                self.config["yolo_confidence"]
+            ),
+            imgsz=int(
+                self.config["yolo_image_size"]
+            ),
+            device="cpu",
+            verbose=False,
+        )
+
+        people = []
+
+        if results:
+
+            result = results[0]
+
+            boxes = result.boxes
+
+            if boxes is not None and len(boxes) > 0:
+
+                coordinates = boxes.xyxy.cpu().numpy()
+
+                tracker_ids = None
+
+                if boxes.id is not None:
+
+                    tracker_ids = (
+                        boxes.id.int().cpu().tolist()
+                    )
+
+                for index, bbox in enumerate(coordinates):
+
+                    x1, y1, x2, y2 = map(int, bbox)
+
+                    # Temporal voting requires a stable track ID.
+
+                    if (
+                        tracker_ids is None
+                        or index >= len(tracker_ids)
+                    ):
+
+                        people.append({
+
+                            "track_id": None,
+
+                            "bbox": [
+                                x1,
+                                y1,
+                                x2,
+                                y2
+                            ],
+
+                            "status": "tracking",
+
+                            "student": None,
+
+                            "last_candidate": None,
+
+                            "similarity": None,
+
+                            "margin": None,
+
+                            "votes": 0,
+
+                            "required_votes": int(
+                                self.config["required_votes"]
+                            ),
+
+                            "face_status": "no_track_id",
+
+                            "face_dimensions": None,
+
+                            "face_error": None,
+
+                        })
+
+                        print(
+                            "[TRACKER] Person detected without Track ID."
+                        )
+
+                        continue
+
+                    track_id = int(
+                        tracker_ids[index]
+                    )
+
+                    # Retrieve or create track state.
+
+                    state = self.track_states.get(track_id)
+
+                    if state is None:
+
+                        print(
+                            f"\n[TRACKER] New track: {track_id}"
+                        )
+
+                        state = TrackState(
+
+                            last_seen=current_time,
+
+                            votes=deque(
+                                maxlen=int(
+                                    self.config["voting_window"]
+                                )
+                            ),
+
+                        )
+
+                        self.track_states[track_id] = state
+
+                    state.last_seen = current_time
+
+                    # Perform face recognition at configured interval.
+
+                    face_interval = float(
+                        self.config["face_check_interval"]
+                    )
+
+                    if (
+                        current_time - state.last_face_check
+                        >= face_interval
+                    ):
+
+                        state.last_face_check = current_time
+
+                        (
+                            embedding,
+                            face_status,
+                            face_dimensions,
+                            face_error,
+                        ) = self._extract_live_embedding(
+                            frame,
+                            bbox
+                        )
+
+                        state.last_face_status = face_status
+
+                        state.last_face_dimensions = face_dimensions
+
+                        state.last_error = face_error
+
+                        if embedding is not None:
+
+                            self._update_identity(
+                                state,
+                                embedding
+                            )
+
+                        else:
+
+                            state.last_candidate = None
+
+                            state.votes.append(None)
+
+                    # Get confirmed student details.
+
+                    student_details = self._get_student_details(
+                        state.confirmed_label
+                    )
+
+                    # -------------------------------------------------
+                    # AUTOMATIC SUPABASE PERSISTENCE
+                    # -------------------------------------------------
+
+                    if student_details is not None:
+
+                        should_save_event = (
+
+                            state.recognition_event_id is None
+
+                            and (
+                                current_time - state.last_event_attempt
+                                >= 5.0
+                                or state.last_event_attempt == 0.0
+                            )
+
+                        )
+
+                        should_update_event = (
+
+                            state.recognition_event_id is not None
+
+                            and (
+                                current_time - state.last_event_update
+                                >= 2.0
+                            )
+
+                        )
+
+                        if (
+                            should_save_event
+                            or should_update_event
+                        ):
+
+                            state.last_event_attempt = current_time
+
+                            self._save_recognition_event(
+
+                                state=state,
+
+                                track_id=track_id,
+
+                                student_details=student_details,
+
+                                similarity=state.last_similarity,
+
+                            )
+
+                    # Determine recognition status.
+
+                    if student_details is not None:
+
+                        status = "recognized"
+
+                    elif state.last_candidate is not None:
+
+                        status = "pending"
+
+                    elif state.last_face_status == "not_checked":
+
+                        status = "tracking"
+
+                    else:
+
+                        status = "unknown"
+
+                    # Count votes for the best candidate.
+
+                    vote_counts = Counter(
+                        vote
+                        for vote in state.votes
+                        if vote is not None
+                    )
+
+                    candidate_votes = (
+                        vote_counts.get(
+                            state.confirmed_label
+                            or state.last_candidate,
+                            0
+                        )
+                    )
+
+                    # Include information required by frontend.
+
+                    people.append({
+
+                        "track_id": track_id,
+
+                        "bbox": [
+                            x1,
+                            y1,
+                            x2,
+                            y2
+                        ],
+
+                        "status": status,
+
+                        "student": student_details,
+
+                        "last_candidate": state.last_candidate,
+
+                        "similarity": state.last_similarity,
+
+                        "margin": state.last_margin,
+
+                        "votes": candidate_votes,
+
+                        "required_votes": int(
+                            self.config["required_votes"]
+                        ),
+
+                        "face_status": state.last_face_status,
+
+                        "face_dimensions": state.last_face_dimensions,
+
+                        "face_error": state.last_error,
+
+                        "recognition_event_id": (
+                            state.recognition_event_id
+                        ),
+
+                    })
+
+        # -----------------------------------------------------
+        # 11. REMOVE EXPIRED TRACKS
+        # -----------------------------------------------------
+
+        lost_timeout = float(
+            self.config["lost_track_timeout"]
+        )
+
+        expired_tracks = [
+
+            track_id
+
+            for track_id, state in self.track_states.items()
+
+            if current_time - state.last_seen > lost_timeout
+
+        ]
+
+        for track_id in expired_tracks:
+
+            print(
+                f"[TRACKER] Removing expired track: {track_id}"
+            )
+
+            del self.track_states[track_id]
+
+        # -----------------------------------------------------
+        # 12. PROCESSING STATISTICS
+        # -----------------------------------------------------
+
+        processing_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        return {
+
+            "type": "recognition_result",
+
+            "frame_width": int(
+                frame.shape[1]
+            ),
+
+            "frame_height": int(
+                frame.shape[0]
+            ),
+
+            "people": people,
+
+            "processing_ms": round(
+                processing_ms,
+                2
+            ),
+
+        }
+
+
+# ---------------------------------------------------------
+# SHARED RECOGNITION ENGINE INSTANCE
+# ---------------------------------------------------------
+
+recognition_engine = RecognitionEngine()
+
+
+========== backend\app\api\routes\enrollment.py ==========
+
+from typing import Optional
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
+
+from app.services.face_enrollment_service import (
+    EnrollmentError,
+    enroll_student,
+)
+
+
+router = APIRouter(
+    prefix="/enrollment",
+    tags=["Student Enrollment"],
+)
+
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024
+
+ALLOWED_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+ALLOWED_SOURCE_TYPES = {
+    "id_card",
+    "face",
+}
+
+
+@router.post("/students")
+async def enroll_student_endpoint(
+    roll_no: str = Form(...),
+    name: str = Form(...),
+    branch: str = Form(...),
+    source_type: str = Form(...),
+    year_of_study: Optional[int] = Form(None),
+    image: UploadFile = File(...),
+):
+    """
+    Register a student and enroll their face.
+
+    Supported enrollment sources:
+        1. id_card: Full student ID-card image.
+        2. face: Direct face photograph or camera capture.
+
+    Both sources use the same face enrollment service.
+    """
+
+    try:
+        # Validate text fields.
+        roll_no = roll_no.strip()
+        name = name.strip()
+        branch = branch.strip()
+        source_type = source_type.strip().lower()
+
+        if not roll_no:
+            raise EnrollmentError("Roll number is required.")
+
+        if not name:
+            raise EnrollmentError("Student name is required.")
+
+        if not branch:
+            raise EnrollmentError("Branch is required.")
+
+        if source_type not in ALLOWED_SOURCE_TYPES:
+            raise EnrollmentError(
+                "Invalid source type. Use 'id_card' or 'face'."
+            )
+
+        if year_of_study is not None and year_of_study not in (1, 2, 3, 4):
+            raise EnrollmentError(
+                "Year of study must be between 1 and 4."
+            )
+
+        # Validate image MIME type.
+        mime_type = (image.content_type or "").lower().strip()
+
+        if mime_type not in ALLOWED_MIME_TYPES:
+            raise EnrollmentError(
+                "Only JPEG, PNG, and WebP images are supported."
+            )
+
+        # Read at most 5 MB + 1 byte to detect oversized uploads.
+        image_bytes = await image.read(MAX_IMAGE_SIZE + 1)
+
+        if not image_bytes:
+            raise EnrollmentError("Uploaded image is empty.")
+
+        if len(image_bytes) > MAX_IMAGE_SIZE:
+            raise EnrollmentError(
+                "Image size must not exceed 5 MB."
+            )
+
+        # Run synchronous AI processing and Supabase operations
+        # outside the asynchronous event loop.
+        result = await run_in_threadpool(
+            enroll_student,
+            roll_no=roll_no,
+            name=name,
+            branch=branch,
+            source_type=source_type,
+            year_of_study=year_of_study,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+        )
+
+        return result
+
+    except EnrollmentError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        # Keep detailed exception information in backend logs.
+        import logging
+
+        logging.exception("Student enrollment failed")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Student enrollment failed. Check backend logs.",
+        ) from exc
+
+    finally:
+        await image.close()
+
+
+========== backend\app\api\routes\students.py ==========
+
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Query, status
+
+from app.schemas.student import (
+    StudentCreate,
+    StudentResponse,
+    StudentStatusUpdate,
+    StudentUpdate,
+)
+from app.services import student_service
+
+
+router = APIRouter(
+    prefix="/students",
+    tags=["Students"],
+)
+
+
+def handle_database_error(exc: Exception) -> None:
+    """Convert duplicate database errors into a clear HTTP response."""
+
+    # PostgreSQL error code 23505 means unique constraint violation.
+    if getattr(exc, "code", None) == "23505":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A student with this roll number is already registered.",
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="A database error occurred while processing the student.",
+    )
+
+
+@router.get("/", response_model=list[StudentResponse])
+def get_students(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    active_only: bool = False,
+):
+    """Retrieve students with pagination."""
+
+    try:
+        return student_service.list_students(
+            limit=limit,
+            offset=offset,
+            active_only=active_only,
+        )
+    except Exception as exc:
+        handle_database_error(exc)
+
+
+@router.get("/roll-no/{roll_no}", response_model=StudentResponse)
+def get_student_by_roll_number(roll_no: str):
+    """Find a registered student by roll number."""
+
+    student = student_service.get_student_by_roll_no(roll_no)
+
+    if not student:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No student found with this roll number.",
+        )
+
+    return student
+
+
+@router.get("/{student_id}", response_model=StudentResponse)
+def get_student(student_id: UUID):
+    """Retrieve one student using their UUID."""
+
+    student = student_service.get_student_by_id(str(student_id))
+
+    if not student:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student not found.",
+        )
+
+    return student
+
+
+@router.post(
+    "/",
+    response_model=StudentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def register_student(student_data: StudentCreate):
+    """Register a new student."""
+
+    try:
+        return student_service.create_student(
+            student_data.model_dump()
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        handle_database_error(exc)
+
+
+@router.put("/{student_id}", response_model=StudentResponse)
+def edit_student(
+    student_id: UUID,
+    student_data: StudentUpdate,
+):
+    """Update an existing student's details."""
+
+    try:
+        student = student_service.update_student(
+            str(student_id),
+            student_data.model_dump(),
+        )
+
+        if not student:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Student not found.",
+            )
+
+        return student
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        handle_database_error(exc)
+
+
+@router.patch(
+    "/{student_id}/status",
+    response_model=StudentResponse,
+)
+def change_student_status(
+    student_id: UUID,
+    status_data: StudentStatusUpdate,
+):
+    """Activate or deactivate a student."""
+
+    student = student_service.update_student_status(
+        str(student_id),
+        status_data.is_active,
+    )
+
+    if not student:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student not found.",
+        )
+
+    return student
+
+
+========== backend\app\api\routes\recognition.py ==========
+
+import asyncio
+
+import cv2
+import numpy as np
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from app.services.recognition_service import recognition_engine
+
+
+router = APIRouter(
+    prefix="/recognition",
+    tags=["Recognition"],
+)
+
+# Only one camera session is permitted at a time.
+camera_lock = asyncio.Lock()
+
+
+@router.websocket("/ws")
+async def recognition_websocket(websocket: WebSocket):
+
+    await websocket.accept()
+
+    # -----------------------------------------------------
+    # 1. PREVENT MULTIPLE CAMERA SESSIONS
+    # -----------------------------------------------------
+
+    if camera_lock.locked():
+
+        await websocket.send_json({
+            "type": "error",
+            "message": "Another camera session is already active.",
+        })
+
+        await websocket.close(code=1013)
+
+        return
+
+    await camera_lock.acquire()
+
+    session_id = None
+
+    try:
+
+        # -------------------------------------------------
+        # 2. INITIALIZE RECOGNITION SESSION
+        # -------------------------------------------------
+
+        print("[WEBSOCKET] Initializing recognition session...")
+
+        session_id = await asyncio.to_thread(
+            recognition_engine.start_session
+        )
+
+        await websocket.send_json({
+            "type": "connected",
+            "message": "AI recognition camera connected.",
+            "session_id": session_id,
+        })
+
+        print(
+            f"[WEBSOCKET] Session connected: {session_id}"
+        )
+
+        # -------------------------------------------------
+        # 3. RECEIVE CAMERA FRAMES
+        # -------------------------------------------------
+
+        while True:
+
+            frame_bytes = await websocket.receive_bytes()
+
+            if not frame_bytes:
+                continue
+
+            # Limit incoming frame size.
+
+            if len(frame_bytes) > 2 * 1024 * 1024:
+
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Camera frame is too large.",
+                })
+
+                continue
+
+            # -------------------------------------------------
+            # 4. DECODE FRAME
+            # -------------------------------------------------
+
+            image_array = np.frombuffer(
+                frame_bytes,
+                dtype=np.uint8,
+            )
+
+            frame = cv2.imdecode(
+                image_array,
+                cv2.IMREAD_COLOR,
+            )
+
+            if frame is None:
+
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Unable to decode camera frame.",
+                })
+
+                continue
+
+            # -------------------------------------------------
+            # 5. RUN AI RECOGNITION
+            # -------------------------------------------------
+
+            result = await asyncio.to_thread(
+                recognition_engine.process_frame,
+                frame,
+                session_id,
+            )
+
+            # -------------------------------------------------
+            # 6. SEND RECOGNITION RESULTS TO FRONTEND
+            # -------------------------------------------------
+
+            await websocket.send_json(result)
+
+    except WebSocketDisconnect:
+
+        print(
+            "[WEBSOCKET] Camera WebSocket disconnected."
+        )
+
+    except Exception as exc:
+
+        print(
+            f"[WEBSOCKET] Recognition error: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        try:
+
+            await websocket.send_json({
+                "type": "error",
+                "message": str(exc),
+            })
+
+        except Exception:
+
+            pass
+
+    finally:
+
+        # -------------------------------------------------
+        # 7. STOP RECOGNITION SESSION
+        # -------------------------------------------------
+
+        try:
+
+            if session_id is not None:
+
+                print(
+                    "[WEBSOCKET] Stopping recognition session..."
+                )
+
+                await asyncio.to_thread(
+                    recognition_engine.stop_session,
+                    session_id,
+                )
+
+        except Exception as exc:
+
+            print(
+                f"[WEBSOCKET] Session cleanup error: {exc}"
+            )
+
+        finally:
+
+            # Always release the camera lock.
+
+            if camera_lock.locked():
+
+                camera_lock.release()
+
+            print(
+                "[WEBSOCKET] Camera session released."
+            )
+
+
+========== backend\app\api\routes\history.py ==========
+from datetime import date, datetime, time, timedelta, timezone
+
+from fastapi import APIRouter, HTTPException, Query
+
+from app.database.supabase_client import get_supabase_client
+
+
+router = APIRouter(prefix="/history", tags=["Recognition History"])
+
+
+def _get_matching_student_ids(supabase, search_term: str) -> list[str]:
+    """Find students by name or roll number without building a raw OR filter."""
+    pattern = f"%{search_term}%"
+
+    name_result = (
+        supabase.table("students")
+        .select("id")
+        .ilike("name", pattern)
+        .limit(500)
+        .execute()
+    )
+
+    roll_result = (
+        supabase.table("students")
+        .select("id")
+        .ilike("roll_no", pattern)
+        .limit(500)
+        .execute()
+    )
+
+    matching_ids = {
+        item["id"]
+        for item in (name_result.data or []) + (roll_result.data or [])
+        if item.get("id")
+    }
+
+    return list(matching_ids)
+
+
+@router.get("/events")
+def get_recognition_history(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    search: str | None = Query(default=None, max_length=100),
+    student_id: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        if start_date and end_date and start_date > end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="start_date cannot be later than end_date.",
+            )
+
+        supabase = get_supabase_client()
+
+        query = (
+            supabase.table("recognition_events")
+            .select(
+                "id, student_id, session_id, track_id, camera_id, "
+                "first_seen, last_seen, similarity_score, created_at",
+                count="exact",
+            )
+        )
+
+        if start_date:
+            start = datetime.combine(
+                start_date,
+                time.min,
+                tzinfo=timezone.utc,
+            )
+            query = query.gte("created_at", start.isoformat())
+
+        if end_date:
+            end_exclusive = datetime.combine(
+                end_date + timedelta(days=1),
+                time.min,
+                tzinfo=timezone.utc,
+            )
+            query = query.lt("created_at", end_exclusive.isoformat())
+
+        if student_id:
+            query = query.eq("student_id", student_id)
+
+        if search and search.strip():
+            matching_ids = _get_matching_student_ids(
+                supabase,
+                search.strip(),
+            )
+
+            if not matching_ids:
+                return {
+                    "success": True,
+                    "events": [],
+                    "pagination": {
+                        "limit": limit,
+                        "offset": offset,
+                        "total": 0,
+                    },
+                }
+
+            query = query.in_("student_id", matching_ids)
+
+        result = (
+            query
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+
+        events = result.data or []
+
+        student_ids = {
+            event["student_id"]
+            for event in events
+            if event.get("student_id")
+        }
+
+        students_by_id = {}
+
+        if student_ids:
+            students_result = (
+                supabase.table("students")
+                .select(
+                    "id, name, roll_no, branch, role, year_of_study"
+                )
+                .in_("id", list(student_ids))
+                .execute()
+            )
+
+            students_by_id = {
+                student["id"]: student
+                for student in (students_result.data or [])
+            }
+
+        output = []
+
+        for event in events:
+            student = students_by_id.get(
+                event.get("student_id"),
+                {},
+            )
+
+            output.append({
+                "event_id": event.get("id"),
+                "student_id": event.get("student_id"),
+                "student_name": student.get("name", "Unknown"),
+                "roll_no": student.get("roll_no", ""),
+                "branch": student.get("branch", ""),
+                "role": student.get("role", ""),
+                "year_of_study": student.get("year_of_study"),
+                "session_id": event.get("session_id"),
+                "track_id": event.get("track_id"),
+                "camera_id": event.get("camera_id"),
+                "first_seen": event.get("first_seen"),
+                "last_seen": event.get("last_seen"),
+                "similarity_score": event.get("similarity_score"),
+                "created_at": event.get("created_at"),
+            })
+
+        return {
+            "success": True,
+            "events": output,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "total": result.count or 0,
+            },
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to retrieve recognition history: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+
+@router.get("/summary")
+def get_history_summary():
+    try:
+        supabase = get_supabase_client()
+
+        now = datetime.now(timezone.utc)
+
+        today_start = now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        week_start = today_start - timedelta(days=6)
+
+        today_result = (
+            supabase.table("recognition_events")
+            .select("id", count="exact", head=True)
+            .gte("created_at", today_start.isoformat())
+            .execute()
+        )
+
+        week_result = (
+            supabase.table("recognition_events")
+            .select("id", count="exact", head=True)
+            .gte("created_at", week_start.isoformat())
+            .execute()
+        )
+
+        total_result = (
+            supabase.table("recognition_events")
+            .select("id", count="exact", head=True)
+            .execute()
+        )
+
+        return {
+            "success": True,
+            "today": today_result.count or 0,
+            "last_seven_days": week_result.count or 0,
+            "all_time": total_result.count or 0,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to retrieve history summary: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+========== backend\app\api\routes\monitoring.py ==========
+import os
+import platform
+import time
+from pathlib import Path
+
+from fastapi import APIRouter
+
+from app.config import settings
+from app.database.supabase_client import get_supabase_client
+
+
+router = APIRouter(prefix="/monitoring", tags=["System Monitoring"])
+
+PROCESS_STARTED_AT = time.time()
+BACKEND_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _model_path(path: str | Path) -> Path:
+    candidate = Path(path)
+
+    if not candidate.is_absolute():
+        candidate = BACKEND_ROOT / candidate
+
+    return candidate
+
+
+def _check_file(name: str, path: Path) -> dict:
+    available = path.is_file()
+
+    return {
+        "name": name,
+        "status": "online" if available else "warning",
+        "available": available,
+        "location": str(path),
+        "details": (
+            "Required file is available."
+            if available
+            else "File was not found at the configured location."
+        ),
+    }
+
+
+def _get_resource_usage() -> dict:
+    usage = {
+        "cpu_percent": None,
+        "memory_percent": None,
+        "memory_used_mb": None,
+    }
+
+    try:
+        import psutil
+
+        process = psutil.Process(os.getpid())
+        memory = psutil.virtual_memory()
+
+        usage["cpu_percent"] = psutil.cpu_percent(interval=None)
+        usage["memory_percent"] = memory.percent
+        usage["memory_used_mb"] = round(
+            process.memory_info().rss / (1024 * 1024),
+            2,
+        )
+
+    except ImportError:
+        pass
+
+    except Exception:
+        # Monitoring should still respond if resource inspection fails.
+        pass
+
+    return usage
+
+
+@router.get("/status")
+def get_system_status():
+    checks = []
+
+    checks.append({
+        "name": "FastAPI Backend",
+        "status": "online",
+        "available": True,
+        "details": "Backend process is responding.",
+    })
+
+    uptime = int(time.time() - PROCESS_STARTED_AT)
+
+    # These checks verify file availability only.
+    # They do not reload models or run inference.
+    yolo_path = _model_path(settings.YOLO_MODEL_PATH)
+
+    checks.append(
+        _check_file("YOLO11 Model", yolo_path)
+    )
+
+    checks.append(
+        _check_file(
+            "ArcFace Weights",
+            BACKEND_ROOT / "models" / "deepface" / "arcface_weights.h5",
+        )
+    )
+
+    checks.append(
+        _check_file(
+            "RetinaFace Weights",
+            BACKEND_ROOT / "models" / "deepface" / "retinaface.h5",
+        )
+    )
+
+    gallery_path = BACKEND_ROOT / "artifacts" / "gallery"
+
+    checks.append(
+        _check_file(
+            "Face Gallery",
+            gallery_path / "face_gallery.npz",
+        )
+    )
+
+    checks.append(
+        _check_file(
+            "Gallery Manifest",
+            gallery_path / "gallery_manifest.json",
+        )
+    )
+
+    database_connected = False
+    active_sessions = None
+    active_cameras = None
+    database_error = None
+
+    try:
+        supabase = get_supabase_client()
+
+        # Lightweight connectivity check.
+        supabase.table("students").select("id").limit(1).execute()
+
+        database_connected = True
+
+        session_result = (
+            supabase.table("recognition_sessions")
+            .select("id", count="exact", head=True)
+            .eq("status", "active")
+            .execute()
+        )
+
+        active_sessions = session_result.count or 0
+
+        camera_result = (
+            supabase.table("cameras")
+            .select("id", count="exact", head=True)
+            .eq("is_active", True)
+            .execute()
+        )
+
+        active_cameras = camera_result.count or 0
+
+    except Exception as exc:
+        database_error = f"{type(exc).__name__}: {exc}"
+
+    checks.append({
+        "name": "Supabase Database",
+        "status": "online" if database_connected else "error",
+        "available": database_connected,
+        "details": (
+            "Database connection successful."
+            if database_connected
+            else database_error
+        ),
+    })
+
+    if active_sessions is not None:
+        checks.append({
+            "name": "Recognition Sessions",
+            "status": "online",
+            "available": True,
+            "details": f"{active_sessions} active session(s).",
+            "value": active_sessions,
+        })
+    else:
+        checks.append({
+            "name": "Recognition Sessions",
+            "status": "unknown",
+            "available": False,
+            "details": "Session status could not be retrieved.",
+        })
+
+    if active_cameras is not None:
+        checks.append({
+            "name": "Configured Cameras",
+            "status": "online",
+            "available": True,
+            "details": f"{active_cameras} active configured camera(s).",
+            "value": active_cameras,
+        })
+    else:
+        checks.append({
+            "name": "Configured Cameras",
+            "status": "unknown",
+            "available": False,
+            "details": "Camera information could not be retrieved.",
+        })
+
+    runtime = {
+        "python_version": platform.python_version(),
+        "operating_system": platform.platform(),
+        "device": settings.DEVICE,
+        "uptime_seconds": uptime,
+        "yolo_confidence": settings.YOLO_CONFIDENCE,
+        "yolo_image_size": settings.YOLO_IMAGE_SIZE,
+        "face_check_interval": settings.FACE_CHECK_INTERVAL,
+        "lost_timeout": settings.LOST_TIMEOUT,
+        "minimum_similarity": settings.MIN_SIMILARITY,
+        "minimum_margin": settings.MIN_MARGIN,
+        "vote_window": settings.VOTE_WINDOW,
+        "required_votes": settings.REQUIRED_VOTES,
+    }
+
+    return {
+        "success": True,
+        "overall_status": _calculate_overall_status(checks),
+        "checked_at": time.time(),
+        "checks": checks,
+        "runtime": runtime,
+        "resources": _get_resource_usage(),
+    }
+
+
+def _calculate_overall_status(checks: list[dict]) -> str:
+    statuses = {
+        item.get("status")
+        for item in checks
+    }
+
+    if "error" in statuses:
+        return "error"
+
+    if "warning" in statuses or "unknown" in statuses:
+        return "warning"
+
+    return "online"
+
+========== frontend\src\services\api.js ==========
+
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
+).replace(/\/+$/, '')
+
+// ---------------------------------------------------------
+// COMMON API REQUEST HANDLER
+// ---------------------------------------------------------
+
+async function apiRequest(endpoint, options = {}) {
+  const isFormData =
+    typeof FormData !== 'undefined' &&
+    options.body instanceof FormData
+
+  const headers = {
+    ...(!isFormData && options.body
+      ? { 'Content-Type': 'application/json' }
+      : {}),
+    ...options.headers,
+  }
+
+  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+    ...options,
+    headers,
+  })
+
+  // Handle empty responses safely.
+  if (response.status === 204) {
+    if (!response.ok) {
+      throw new Error(`Backend returned HTTP ${response.status}`)
+    }
+
+    return null
+  }
+
+  const contentType = response.headers.get('content-type') || ''
+
+  let data
+
+  if (contentType.includes('application/json')) {
+    data = await response.json().catch(() => null)
+  } else {
+    data = await response.text().catch(() => '')
+  }
+
+  if (!response.ok) {
+    const message =
+      typeof data?.detail === 'string'
+        ? data.detail
+        : typeof data?.message === 'string'
+          ? data.message
+          : typeof data === 'string' && data
+            ? data
+            : `Backend returned HTTP ${response.status}`
+
+    throw new Error(message)
+  }
+
+  return data
+}
+
+
+// ---------------------------------------------------------
+// BACKEND HEALTH
+// ---------------------------------------------------------
+
+export async function getBackendHealth() {
+  return apiRequest('/health')
+}
+
+
+// ---------------------------------------------------------
+// STUDENT MANAGEMENT
+// ---------------------------------------------------------
+
+export async function getStudents({
+  limit = 100,
+  offset = 0,
+  activeOnly = false,
+} = {}) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+    active_only: String(activeOnly),
+  })
+
+  return apiRequest(`/api/students/?${params.toString()}`)
+}
+
+
+export async function getStudentById(studentId) {
+  return apiRequest(
+    `/api/students/${encodeURIComponent(studentId)}`
+  )
+}
+
+
+export async function getStudentByRollNo(rollNo) {
+  return apiRequest(
+    `/api/students/roll-no/${encodeURIComponent(rollNo)}`
+  )
+}
+
+
+export async function registerStudent(studentData) {
+  return apiRequest('/api/students/', {
+    method: 'POST',
+    body: JSON.stringify(studentData),
+  })
+}
+
+
+export async function updateStudent(studentId, studentData) {
+  return apiRequest(
+    `/api/students/${encodeURIComponent(studentId)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify(studentData),
+    }
+  )
+}
+
+
+export async function updateStudentStatus(studentId, isActive) {
+  return apiRequest(
+    `/api/students/${encodeURIComponent(studentId)}/status`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({
+        is_active: isActive,
+      }),
+    }
+  )
+}
+
+
+// ---------------------------------------------------------
+// STUDENT FACE ENROLLMENT
+// ---------------------------------------------------------
+
+export async function enrollStudent({
+  name,
+  roll_no,
+  branch,
+  year_of_study,
+  source_type = 'id_card',
+  image,
+}) {
+  if (!name?.trim()) {
+    throw new Error('Student name is required.')
+  }
+
+  if (!roll_no?.trim()) {
+    throw new Error('Roll number is required.')
+  }
+
+  if (!branch?.trim()) {
+    throw new Error('Branch is required.')
+  }
+
+  if (!image) {
+    throw new Error('Student image is required.')
+  }
+
+  if (!['id_card', 'face'].includes(source_type)) {
+    throw new Error('Invalid enrollment source type.')
+  }
+
+  const formData = new FormData()
+
+  formData.append('name', name.trim())
+  formData.append('roll_no', roll_no.trim())
+  formData.append('branch', branch.trim())
+  formData.append('source_type', source_type)
+  formData.append('image', image)
+
+  if (year_of_study !== '' && year_of_study != null) {
+    formData.append('year_of_study', String(year_of_study))
+  }
+
+  // Do not manually set Content-Type.
+  // The browser supplies the multipart/form-data boundary.
+  //
+  // This endpoint matches:
+  // backend/app/api/routes/enrollment.py
+  //
+  // POST /api/enrollment/students
+
+  return apiRequest('/api/enrollment/students', {
+    method: 'POST',
+    body: formData,
+  })
+}
+
+
+// ---------------------------------------------------------
+// DASHBOARD
+// ---------------------------------------------------------
+
+export async function getDashboardSummary() {
+  return apiRequest('/api/dashboard/summary')
+}
+
+
+export async function getDashboardActivity(days = 7) {
+  const safeDays = Math.max(1, Math.min(365, Number(days) || 7))
+
+  return apiRequest(
+    `/api/dashboard/activity?days=${safeDays}`
+  )
+}
+
+
+// ---------------------------------------------------------
+// RECOGNITION HISTORY
+// ---------------------------------------------------------
+
+export async function getRecognitionHistory({
+  startDate = '',
+  endDate = '',
+  search = '',
+  studentId = '',
+  limit = 20,
+  offset = 0,
+} = {}) {
+  const params = new URLSearchParams()
+
+  if (startDate) params.set('start_date', startDate)
+  if (endDate) params.set('end_date', endDate)
+  if (search) params.set('search', search)
+  if (studentId) params.set('student_id', studentId)
+
+  params.set('limit', String(limit))
+  params.set('offset', String(offset))
+
+  return apiRequest(
+    `/api/history/events?${params.toString()}`
+  )
+}
+
+
+export async function getRecognitionHistorySummary() {
+  return apiRequest('/api/history/summary')
+}
+
+
+// ---------------------------------------------------------
+// SYSTEM MONITORING
+// ---------------------------------------------------------
+
+export async function getSystemMonitoring() {
+  return apiRequest('/api/monitoring/status')
+}
+
+
+// ---------------------------------------------------------
+// EXPORT
+// ---------------------------------------------------------
+
+export { API_BASE_URL }
+
+
+========== frontend\src\pages\StudentEnrollment.jsx ==========
+
+import { useEffect, useRef, useState } from 'react'
+import { enrollStudent } from '../services/api'
+
+const initialForm = {
+  name: '',
+  roll_no: '',
+  branch: '',
+  year_of_study: '',
+  source_type: 'id_card',
+}
+
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024
+const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+
+export default function StudentEnrollment() {
+  const [form, setForm] = useState(initialForm)
+  const [image, setImage] = useState(null)
+  const [preview, setPreview] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState(null)
+  const [cameraActive, setCameraActive] = useState(false)
+
+  const videoRef = useRef(null)
+  const canvasRef = useRef(null)
+  const streamRef = useRef(null)
+  const fileInputRef = useRef(null)
+
+  function stopCamera() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+
+    setCameraActive(false)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop())
+      }
+    }
+  }, [])
+
+  function updateField(event) {
+    const { name, value } = event.target
+
+    setForm((current) => ({
+      ...current,
+      [name]: value,
+    }))
+
+    setError('')
+    setSuccess(null)
+
+    if (name === 'source_type') {
+      setImage(null)
+      setPreview('')
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+
+      stopCamera()
+    }
+  }
+
+  function setSelectedImage(file) {
+    if (!file) return
+
+    if (!ALLOWED_TYPES.includes(file.type)) {
+      setError('Only JPEG, PNG, and WebP images are supported.')
+      return
+    }
+
+    if (file.size > MAX_IMAGE_SIZE) {
+      setError('Image size must not exceed 5 MB.')
+      return
+    }
+
+    setImage(file)
+    setPreview(URL.createObjectURL(file))
+    setError('')
+    setSuccess(null)
+  }
+
+  function handleImageChange(event) {
+    const selectedFile = event.target.files?.[0] || null
+
+    if (selectedFile) {
+      setSelectedImage(selectedFile)
+    }
+  }
+
+  async function startCamera() {
+    setError('')
+    setSuccess(null)
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('Camera access is not supported by this browser. Use image upload instead.')
+      return
+    }
+
+    try {
+      stopCamera()
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      })
+
+      streamRef.current = stream
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        await videoRef.current.play()
+      }
+
+      setCameraActive(true)
+    } catch (err) {
+      stopCamera()
+      setError(
+        err.name === 'NotAllowedError'
+          ? 'Camera permission was denied. Allow camera access or upload an image.'
+          : `Unable to start camera: ${err.message}`
+      )
+    }
+  }
+
+  function capturePhoto() {
+    const video = videoRef.current
+    const canvas = canvasRef.current
+
+    if (!video || !canvas || !video.videoWidth) {
+      setError('Camera is not ready. Please wait and try again.')
+      return
+    }
+
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+
+    const context = canvas.getContext('2d')
+
+    if (!context) {
+      setError('Unable to capture the camera image.')
+      return
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          setError('Could not capture the image. Please try again.')
+          return
+        }
+
+        const capturedFile = new File(
+          [blob],
+          `face-capture-${Date.now()}.jpg`,
+          { type: 'image/jpeg' }
+        )
+
+        setSelectedImage(capturedFile)
+        stopCamera()
+      },
+      'image/jpeg',
+      0.92
+    )
+  }
+
+  function clearImage() {
+    setImage(null)
+    setPreview('')
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }
+
+  async function handleSubmit(event) {
+    event.preventDefault()
+
+    setError('')
+    setSuccess(null)
+
+    if (!form.name.trim() || !form.roll_no.trim() || !form.branch.trim()) {
+      setError('Please complete all required student details.')
+      return
+    }
+
+    if (!image) {
+      setError(
+        form.source_type === 'id_card'
+          ? 'Please upload the student ID-card image.'
+          : 'Please upload a face photograph or capture one using the camera.'
+      )
+      return
+    }
+
+    if (!ALLOWED_TYPES.includes(image.type)) {
+      setError('Only JPEG, PNG, and WebP images are supported.')
+      return
+    }
+
+    if (image.size > MAX_IMAGE_SIZE) {
+      setError('Image size must not exceed 5 MB.')
+      return
+    }
+
+    try {
+      setLoading(true)
+      stopCamera()
+
+      const result = await enrollStudent({
+        ...form,
+        name: form.name.trim(),
+        roll_no: form.roll_no.trim(),
+        branch: form.branch.trim(),
+        year_of_study: form.year_of_study,
+        image,
+      })
+
+      setSuccess(result)
+
+      setForm(initialForm)
+      setImage(null)
+      setPreview('')
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+    } catch (err) {
+      setError(err.message || 'Student enrollment failed.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const student = success?.student
+
+  return (
+    <div className="min-h-screen bg-slate-950 px-4 py-8 text-slate-100 sm:px-8">
+      <div className="mx-auto max-w-4xl">
+        <div className="mb-8">
+          <p className="text-sm font-medium uppercase tracking-wider text-cyan-400">
+            Student management
+          </p>
+
+          <h1 className="mt-2 text-3xl font-bold">
+            Student face enrollment
+          </h1>
+
+          <p className="mt-2 max-w-2xl text-sm text-slate-400">
+            Register a student using either their ID card or a direct
+            face photograph. You can also capture the face using your camera.
+          </p>
+        </div>
+
+        <form
+          onSubmit={handleSubmit}
+          className="space-y-6 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl"
+        >
+          <section>
+            <h2 className="mb-4 text-lg font-semibold">Student details</h2>
+
+            <div className="grid gap-5 sm:grid-cols-2">
+              <div>
+                <label className="mb-2 block text-sm text-slate-300">
+                  Student name
+                </label>
+                <input
+                  required
+                  name="name"
+                  value={form.name}
+                  onChange={updateField}
+                  placeholder="Enter full name"
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm text-slate-300">
+                  Roll number
+                </label>
+                <input
+                  required
+                  name="roll_no"
+                  value={form.roll_no}
+                  onChange={updateField}
+                  placeholder="Enter roll number"
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm text-slate-300">
+                  Branch
+                </label>
+                <input
+                  required
+                  name="branch"
+                  value={form.branch}
+                  onChange={updateField}
+                  placeholder="Example: AI & DS"
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm text-slate-300">
+                  Year of study
+                </label>
+                <select
+                  name="year_of_study"
+                  value={form.year_of_study}
+                  onChange={updateField}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500"
+                >
+                  <option value="">Select year</option>
+                  <option value="1">1st year</option>
+                  <option value="2">2nd year</option>
+                  <option value="3">3rd year</option>
+                  <option value="4">4th year</option>
+                </select>
+              </div>
+            </div>
+          </section>
+
+          <div className="border-t border-slate-800 pt-6">
+            <h2 className="mb-4 text-lg font-semibold">Choose enrollment method</h2>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label
+                className={`cursor-pointer rounded-xl border p-4 ${
+                  form.source_type === 'id_card'
+                    ? 'border-cyan-500 bg-cyan-950/30'
+                    : 'border-slate-700 bg-slate-950'
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="source_type"
+                  value="id_card"
+                  checked={form.source_type === 'id_card'}
+                  onChange={updateField}
+                  className="mr-2 accent-cyan-500"
+                />
+                <span className="font-semibold">ID-card upload</span>
+                <p className="mt-2 text-sm text-slate-400">
+                  Upload the complete student ID card. The backend extracts
+                  the face region.
+                </p>
+              </label>
+
+              <label
+                className={`cursor-pointer rounded-xl border p-4 ${
+                  form.source_type === 'face'
+                    ? 'border-cyan-500 bg-cyan-950/30'
+                    : 'border-slate-700 bg-slate-950'
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="source_type"
+                  value="face"
+                  checked={form.source_type === 'face'}
+                  onChange={updateField}
+                  className="mr-2 accent-cyan-500"
+                />
+                <span className="font-semibold">Direct face registration</span>
+                <p className="mt-2 text-sm text-slate-400">
+                  Upload a face photograph or capture a new photograph
+                  using your camera.
+                </p>
+              </label>
+            </div>
+          </div>
+
+          <section className="border-t border-slate-800 pt-6">
+            <h2 className="mb-2 text-lg font-semibold">
+              {form.source_type === 'id_card'
+                ? 'Upload student ID card'
+                : 'Register face photograph'}
+            </h2>
+
+            <p className="mb-4 text-sm text-slate-400">
+              JPEG, PNG or WebP. Maximum file size: 5 MB.
+            </p>
+
+            {form.source_type === 'face' && (
+              <div className="mb-5 rounded-xl border border-slate-700 bg-slate-950 p-4">
+                <p className="mb-3 font-medium">Live camera capture</p>
+
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className={`mb-4 w-full max-h-96 rounded-lg bg-black object-contain ${
+                    cameraActive ? 'block' : 'hidden'
+                  }`}
+                />
+
+                <canvas ref={canvasRef} className="hidden" />
+
+                <div className="flex flex-wrap gap-3">
+                  {!cameraActive ? (
+                    <button
+                      type="button"
+                      onClick={startCamera}
+                      disabled={loading}
+                      className="rounded-lg border border-cyan-500 px-4 py-2 text-sm font-semibold text-cyan-300 hover:bg-cyan-950"
+                    >
+                      Start camera
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={capturePhoto}
+                        className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400"
+                      >
+                        Capture photograph
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={stopCamera}
+                        className="rounded-lg border border-slate-600 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800"
+                      >
+                        Stop camera
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                <p className="mt-3 text-xs text-slate-500">
+                  Allow browser camera permission when prompted. Camera access
+                  normally requires localhost or HTTPS.
+                </p>
+              </div>
+            )}
+
+            <label className="mb-2 block text-sm text-slate-300">
+              {form.source_type === 'id_card'
+                ? 'Select ID-card image'
+                : 'Upload face photograph'}
+            </label>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={handleImageChange}
+              className="block w-full rounded-lg border border-dashed border-slate-600 bg-slate-950 p-4 text-sm text-slate-300 file:mr-4 file:rounded-md file:border-0 file:bg-cyan-500 file:px-4 file:py-2 file:font-semibold file:text-slate-950"
+            />
+
+            {preview && (
+              <div className="mt-5 rounded-xl border border-slate-700 bg-slate-950 p-4">
+                <p className="mb-3 text-sm font-medium text-cyan-300">
+                  Selected image preview
+                </p>
+
+                <img
+                  src={preview}
+                  alt="Selected enrollment image"
+                  className="max-h-72 max-w-full rounded-lg object-contain"
+                />
+
+                <p className="mt-3 break-all text-xs text-slate-400">
+                  {image?.name}
+                </p>
+
+                <button
+                  type="button"
+                  onClick={clearImage}
+                  className="mt-3 text-sm text-red-300 hover:text-red-200"
+                >
+                  Remove selected image
+                </button>
+              </div>
+            )}
+          </section>
+
+          {error && (
+            <div className="rounded-lg border border-red-800 bg-red-950/40 p-4 text-sm text-red-300">
+              {error}
+            </div>
+          )}
+
+          {success && (
+            <div className="rounded-lg border border-emerald-800 bg-emerald-950/30 p-4 text-sm text-emerald-300">
+              <p className="font-semibold">
+                Face enrollment completed successfully.
+              </p>
+
+              <p className="mt-2">
+                {student?.name} — {student?.roll_no}
+              </p>
+
+              <p>
+                Embeddings saved: {success.embeddings_saved ?? success.embedding_count ?? 'Not reported'}
+              </p>
+
+              <p>
+                Enrollment status: {student?.enrollment_status ?? success.enrollment_status}
+              </p>
+
+              <p className="mt-1 text-xs text-emerald-400">
+                {success.created
+                  ? 'New student registered.'
+                  : 'Existing student enrolled.'}
+              </p>
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full rounded-lg bg-cyan-500 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading
+              ? 'Processing face and saving enrollment...'
+              : 'Register and enroll student'}
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+
+========== backend\requirements.txt ==========
+
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+python-dotenv
+numpy
+opencv-python-headless
+ultralytics
+supabase
+orjson
+
