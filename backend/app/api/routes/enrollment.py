@@ -1,4 +1,3 @@
-
 import logging
 from typing import Optional
 
@@ -37,6 +36,12 @@ ALLOWED_SOURCE_TYPES = {
     "face",
 }
 
+ALLOWED_ROLES = {
+    "student",
+    "faculty",
+    "staff",
+}
+
 
 @router.post("/students")
 @router.post("/students/")
@@ -44,6 +49,7 @@ async def enroll_student_endpoint(
     roll_no: str = Form(...),
     name: str = Form(...),
     branch: str = Form(...),
+    role: str = Form("student"),
     source_type: str = Form(...),
     year_of_study: Optional[int] = Form(None),
     image: UploadFile = File(...),
@@ -53,42 +59,49 @@ async def enroll_student_endpoint(
         roll_no = roll_no.strip()
         name = name.strip()
         branch = branch.strip()
+        role = role.strip().lower()
         source_type = source_type.strip().lower()
 
         if not roll_no:
             raise HTTPException(
                 status_code=400,
-                detail="Roll number is required.",
+                detail="Roll number / ID is required.",
             )
 
         if not name:
             raise HTTPException(
                 status_code=400,
-                detail="Student name is required.",
+                detail="Name is required.",
             )
 
         if not branch:
             raise HTTPException(
                 status_code=400,
-                detail="Branch is required.",
+                detail="Branch / Department is required.",
+            )
+
+        if role not in ALLOWED_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail="Role must be 'student', 'faculty', or 'staff'.",
             )
 
         if len(roll_no) > 50:
             raise HTTPException(
                 status_code=400,
-                detail="Roll number cannot exceed 50 characters.",
+                detail="Roll number / ID cannot exceed 50 characters.",
             )
 
         if len(name) > 150:
             raise HTTPException(
                 status_code=400,
-                detail="Student name cannot exceed 150 characters.",
+                detail="Name cannot exceed 150 characters.",
             )
 
         if len(branch) > 100:
             raise HTTPException(
                 status_code=400,
-                detail="Branch cannot exceed 100 characters.",
+                detail="Branch / Department cannot exceed 100 characters.",
             )
 
         if source_type not in ALLOWED_SOURCE_TYPES:
@@ -97,11 +110,15 @@ async def enroll_student_endpoint(
                 detail="Source type must be 'id_card' or 'face'.",
             )
 
-        if year_of_study is not None and year_of_study not in (1, 2, 3, 4):
-            raise HTTPException(
-                status_code=400,
-                detail="Year of study must be between 1 and 4.",
-            )
+        # Conditional Year of Study validation: only required for students
+        if role == "student":
+            if year_of_study is None or year_of_study not in (1, 2, 3, 4):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Year of study must be between 1 and 4 for students.",
+                )
+        else:
+            year_of_study = None
 
         # Validate file type.
         mime_type = (image.content_type or "").lower().strip()
@@ -133,6 +150,7 @@ async def enroll_student_endpoint(
             roll_no=roll_no,
             name=name,
             branch=branch,
+            role=role,
             source_type=source_type,
             year_of_study=year_of_study,
             image_bytes=image_bytes,
@@ -140,8 +158,9 @@ async def enroll_student_endpoint(
         )
 
         logger.info(
-            "Enrollment completed for roll number %s",
+            "Enrollment completed for roll number / ID %s with role %s",
             roll_no,
+            role,
         )
 
         return result
@@ -151,7 +170,7 @@ async def enroll_student_endpoint(
 
     except EnrollmentError as exc:
         logger.warning(
-            "Enrollment rejected for roll number %s: %s",
+            "Enrollment rejected for roll number / ID %s: %s",
             roll_no,
             str(exc),
         )
@@ -163,7 +182,7 @@ async def enroll_student_endpoint(
 
     except Exception as exc:
         logger.exception(
-            "Unexpected enrollment failure for roll number %s",
+            "Unexpected enrollment failure for roll number / ID %s",
             roll_no,
         )
 

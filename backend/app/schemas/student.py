@@ -1,14 +1,13 @@
-
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StudentCreate(BaseModel):
     """
-    Fields required when creating a student record.
+    Fields required when creating a student, faculty, or staff record.
 
     Face-photo and ID-card enrollment are handled separately
     by the face enrollment endpoint.
@@ -31,24 +30,31 @@ class StudentCreate(BaseModel):
         max_length=100,
     )
 
-    role: Literal["student", "admin"] = "student"
+    role: Literal["student", "faculty", "staff", "admin"] = "student"
 
-    year_of_study: int | None = Field(
+    year_of_study: Optional[int] = Field(
         default=None,
         ge=1,
         le=4,
     )
 
+    @model_validator(mode="after")
+    def validate_role_and_year(self) -> "StudentCreate":
+        if self.role == "student":
+            if self.year_of_study is None:
+                raise ValueError("Year of study is required for students.")
+        else:
+            # Non-students do not use year of study
+            self.year_of_study = None
+        return self
+
 
 class StudentUpdate(BaseModel):
     """
-    Fields allowed when updating ordinary student details.
+    Fields allowed when updating ordinary student or staff details.
 
     Every field is optional so the frontend can update
-    individual student properties without resending all details.
-
-    Enrollment status, face embeddings, and recognition data
-    cannot be modified through this schema.
+    individual properties without resending all details.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -71,7 +77,7 @@ class StudentUpdate(BaseModel):
         max_length=100,
     )
 
-    role: Literal["student", "admin"] | None = None
+    role: Literal["student", "faculty", "staff", "admin"] | None = None
 
     year_of_study: int | None = Field(
         default=None,
@@ -79,9 +85,18 @@ class StudentUpdate(BaseModel):
         le=4,
     )
 
+    @model_validator(mode="after")
+    def validate_role_and_year(self) -> "StudentUpdate":
+        if self.role == "student" and self.year_of_study is not None:
+            if self.year_of_study not in (1, 2, 3, 4):
+                raise ValueError("Year of study must be between 1 and 4.")
+        elif self.role and self.role != "student":
+            self.year_of_study = None
+        return self
+
 
 class StudentStatusUpdate(BaseModel):
-    """Activate or deactivate a student."""
+    """Activate or deactivate a record."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -90,12 +105,9 @@ class StudentStatusUpdate(BaseModel):
 
 class StudentResponse(BaseModel):
     """
-    Complete student information returned by the API.
+    Complete information returned by the API.
 
-    Includes ordinary student details and enrollment metadata.
-
-    Face embeddings and private storage paths are deliberately
-    excluded from the public student response.
+    Includes ordinary details and enrollment metadata.
     """
 
     model_config = ConfigDict(

@@ -5,6 +5,7 @@ const initialForm = {
   name: '',
   roll_no: '',
   branch: '',
+  role: 'student',
   year_of_study: '',
   source_type: 'id_card',
 }
@@ -233,9 +234,10 @@ export default function StudentEnrollment() {
     const name = form.name.trim()
     const rollNo = form.roll_no.trim()
     const branch = form.branch.trim()
+    const role = form.role.trim()
 
-    if (!name || !rollNo || !branch) {
-      setError('Please complete all required student details.')
+    if (!name || !rollNo || !branch || !role) {
+      setError('Please complete all required details.')
       return
     }
 
@@ -244,22 +246,24 @@ export default function StudentEnrollment() {
       rollNo.length > 50 ||
       branch.length > 100
     ) {
-      setError('Please check the maximum allowed length of the student details.')
+      setError('Please check the maximum allowed length of the input fields.')
       return
     }
 
-    if (
-      form.year_of_study &&
-      !['1', '2', '3', '4'].includes(String(form.year_of_study))
-    ) {
-      setError('Please select a valid year of study.')
-      return
+    if (role === 'student') {
+      if (
+        !form.year_of_study ||
+        !['1', '2', '3', '4'].includes(String(form.year_of_study))
+      ) {
+        setError('Please select a valid year of study for students.')
+        return
+      }
     }
 
     if (!image) {
       setError(
         form.source_type === 'id_card'
-          ? 'Please upload the student ID-card image.'
+          ? 'Please upload the ID-card image.'
           : 'Please upload a face photograph or capture one using the camera.'
       )
       return
@@ -283,9 +287,11 @@ export default function StudentEnrollment() {
         name,
         roll_no: rollNo,
         branch,
-        year_of_study: form.year_of_study
-          ? Number(form.year_of_study)
-          : null,
+        role,
+        year_of_study:
+          role === 'student' && form.year_of_study
+            ? Number(form.year_of_study)
+            : null,
         source_type: form.source_type,
         image,
       })
@@ -298,7 +304,7 @@ export default function StudentEnrollment() {
         fileInputRef.current.value = ''
       }
     } catch (err) {
-      setError(err.message || 'Student enrollment failed.')
+      setError(err.message || 'Enrollment failed.')
     } finally {
       setLoading(false)
     }
@@ -311,16 +317,15 @@ export default function StudentEnrollment() {
       <div className="mx-auto max-w-4xl">
         <div className="mb-8">
           <p className="text-sm font-medium uppercase tracking-wider text-cyan-400">
-            Student management
+            User management
           </p>
 
           <h1 className="mt-2 text-3xl font-bold">
-            Student face enrollment
+            Face enrollment & registration
           </h1>
 
           <p className="mt-2 max-w-2xl text-sm text-slate-400">
-            Register a student using either their ID card or a direct
-            face photograph. You can also capture the face using your camera.
+            Register a student, faculty, or staff member using their ID card or direct photograph.
           </p>
         </div>
 
@@ -329,14 +334,13 @@ export default function StudentEnrollment() {
           className="space-y-6 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl"
         >
           <section>
-            <h2 className="mb-4 text-lg font-semibold">Student details</h2>
+            <h2 className="mb-4 text-lg font-semibold">Details</h2>
 
             <div className="grid gap-5 sm:grid-cols-2">
               <div>
                 <label className="mb-2 block text-sm text-slate-300">
-                  Student name
+                  Full name
                 </label>
-
                 <input
                   required
                   maxLength={150}
@@ -351,16 +355,15 @@ export default function StudentEnrollment() {
 
               <div>
                 <label className="mb-2 block text-sm text-slate-300">
-                  Roll number
+                  Roll number / ID
                 </label>
-
                 <input
                   required
                   maxLength={50}
                   name="roll_no"
                   value={form.roll_no}
                   onChange={updateField}
-                  placeholder="Enter roll number"
+                  placeholder="Enter roll number or ID"
                   disabled={loading}
                   className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500 disabled:opacity-60"
                 />
@@ -368,9 +371,8 @@ export default function StudentEnrollment() {
 
               <div>
                 <label className="mb-2 block text-sm text-slate-300">
-                  Branch
+                  Branch / Department
                 </label>
-
                 <input
                   required
                   maxLength={100}
@@ -385,23 +387,41 @@ export default function StudentEnrollment() {
 
               <div>
                 <label className="mb-2 block text-sm text-slate-300">
-                  Year of study
+                  Role
                 </label>
-
                 <select
-                  name="year_of_study"
-                  value={form.year_of_study}
+                  name="role"
+                  value={form.role}
                   onChange={updateField}
                   disabled={loading}
                   className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500 disabled:opacity-60"
                 >
-                  <option value="">Select year</option>
-                  <option value="1">1st year</option>
-                  <option value="2">2nd year</option>
-                  <option value="3">3rd year</option>
-                  <option value="4">4th year</option>
+                  <option value="student">Student</option>
+                  <option value="faculty">Faculty</option>
+                  <option value="staff">Staff</option>
                 </select>
               </div>
+
+              {form.role === 'student' && (
+                <div className="sm:col-span-2">
+                  <label className="mb-2 block text-sm text-slate-300">
+                    Year of study
+                  </label>
+                  <select
+                    name="year_of_study"
+                    value={form.year_of_study}
+                    onChange={updateField}
+                    disabled={loading}
+                    className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500 disabled:opacity-60"
+                  >
+                    <option value="">Select year</option>
+                    <option value="1">1st year</option>
+                    <option value="2">2nd year</option>
+                    <option value="3">3rd year</option>
+                    <option value="4">4th year</option>
+                  </select>
+                </div>
+              )}
             </div>
           </section>
 
@@ -431,8 +451,7 @@ export default function StudentEnrollment() {
                 <span className="font-semibold">ID-card upload</span>
 
                 <p className="mt-2 text-sm text-slate-400">
-                  Upload the complete student ID card. The backend extracts
-                  the face region.
+                  Upload the complete ID card. The backend extracts the face region.
                 </p>
               </label>
 
@@ -456,8 +475,7 @@ export default function StudentEnrollment() {
                 <span className="font-semibold">Direct face registration</span>
 
                 <p className="mt-2 text-sm text-slate-400">
-                  Upload a face photograph or capture a new photograph
-                  using your camera.
+                  Upload a face photograph or capture a new one using your camera.
                 </p>
               </label>
             </div>
@@ -466,7 +484,7 @@ export default function StudentEnrollment() {
           <section className="border-t border-slate-800 pt-6">
             <h2 className="mb-2 text-lg font-semibold">
               {form.source_type === 'id_card'
-                ? 'Upload student ID card'
+                ? 'Upload ID card image'
                 : 'Register face photograph'}
             </h2>
 
@@ -522,19 +540,8 @@ export default function StudentEnrollment() {
                     </>
                   )}
                 </div>
-
-                <p className="mt-3 text-xs text-slate-500">
-                  Allow browser camera permission when prompted. Camera access
-                  normally requires localhost or HTTPS.
-                </p>
               </div>
             )}
-
-            <label className="mb-2 block text-sm text-slate-300">
-              {form.source_type === 'id_card'
-                ? 'Select ID-card image'
-                : 'Upload face photograph'}
-            </label>
 
             <input
               ref={fileInputRef}
@@ -556,14 +563,6 @@ export default function StudentEnrollment() {
                   alt="Selected enrollment image"
                   className="max-h-72 max-w-full rounded-lg object-contain"
                 />
-
-                <p className="mt-3 break-all text-xs text-slate-400">
-                  {image?.name}
-                </p>
-
-                <p className="mt-1 text-xs text-slate-500">
-                  {(image.size / (1024 * 1024)).toFixed(2)} MB
-                </p>
 
                 <button
                   type="button"
@@ -592,29 +591,10 @@ export default function StudentEnrollment() {
               className="rounded-lg border border-emerald-800 bg-emerald-950/30 p-4 text-sm text-emerald-300"
             >
               <p className="font-semibold">
-                Face enrollment completed successfully.
+                Enrollment completed successfully.
               </p>
-
               <p className="mt-2">
-                {student?.name} — {student?.roll_no}
-              </p>
-
-              <p>
-                Embeddings saved:{' '}
-                {success.embedding_count ??
-                  success.embeddings_saved ??
-                  '5'}
-              </p>
-
-              <p>
-                Enrollment status:{' '}
-                {student?.enrollment_status ?? success.enrollment_status ?? 'enrolled'}
-              </p>
-
-              <p className="mt-1 text-xs text-emerald-400">
-                {success.created
-                  ? 'New student registered.'
-                  : 'Existing student enrolled.'}
+                {student?.name} — {student?.roll_no} ({student?.role})
               </p>
             </div>
           )}
@@ -624,9 +604,7 @@ export default function StudentEnrollment() {
             disabled={loading}
             className="w-full rounded-lg bg-cyan-500 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {loading
-              ? 'Processing face and saving enrollment...'
-              : 'Register and enroll student'}
+            {loading ? 'Processing and saving enrollment...' : 'Register and enroll'}
           </button>
         </form>
       </div>

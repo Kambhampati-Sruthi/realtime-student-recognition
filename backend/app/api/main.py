@@ -18,18 +18,21 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Build clean CORS allowlist without None/empty strings
-allowed_origins = [
-    origin
-    for origin in [
-        getattr(settings, "FRONTEND_ORIGIN", None),
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
-    if origin
+# Support single or comma-separated FRONTEND_ORIGIN values and strip trailing slashes
+configured_origins = [
+    origin.strip().rstrip("/")
+    for origin in (getattr(settings, "FRONTEND_ORIGIN", None) or "").split(",")
+    if origin.strip()
 ]
+
+default_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+allowed_origins = list(dict.fromkeys([*configured_origins, *default_origins]))
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount uploads/data directory if present so saved student images can be previewed in UI
+# Mount uploads/data directory if present so saved images can be previewed in UI
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 

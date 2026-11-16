@@ -1,4 +1,3 @@
-
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -42,29 +41,46 @@ def _validate_student_details(
     roll_no: str,
     name: str,
     branch: str,
+    role: str,
     source_type: str,
     mime_type: str,
     year_of_study: int | None,
 ):
     if not all(
         isinstance(value, str)
-        for value in (roll_no, name, branch, source_type, mime_type)
+        for value in (roll_no, name, branch, role, source_type, mime_type)
     ):
-        raise EnrollmentError("Invalid student registration details.")
+        raise EnrollmentError("Invalid registration details.")
 
-    if not roll_no or not name or not branch:
+    if not roll_no or not name or not branch or not role:
         raise EnrollmentError(
-            "Roll number, name and branch are required."
+            "Roll number/ID, name, branch, and role are required."
         )
 
+    if role not in {"student", "faculty", "staff"}:
+        raise EnrollmentError("Invalid role specified.")
+
     if len(roll_no) > 50:
-        raise EnrollmentError("Roll number cannot exceed 50 characters.")
+        raise EnrollmentError("Roll number/ID cannot exceed 50 characters.")
 
     if len(name) > 150:
         raise EnrollmentError("Name cannot exceed 150 characters.")
 
     if len(branch) > 100:
         raise EnrollmentError("Branch cannot exceed 100 characters.")
+
+    if role == "student":
+        if (
+            isinstance(year_of_study, bool)
+            or not isinstance(year_of_study, int)
+            or year_of_study not in (1, 2, 3, 4)
+        ):
+            raise EnrollmentError(
+                "Year of study must be an integer between 1 and 4 for students."
+            )
+    else:
+        # Non-students do not require or use a year of study
+        pass
 
     if source_type not in {"face", "id_card"}:
         raise EnrollmentError(
@@ -75,16 +91,6 @@ def _validate_student_details(
         raise EnrollmentError(
             "Only JPEG, PNG and WebP images are supported."
         )
-
-    if year_of_study is not None:
-        if (
-            isinstance(year_of_study, bool)
-            or not isinstance(year_of_study, int)
-            or year_of_study not in (1, 2, 3, 4)
-        ):
-            raise EnrollmentError(
-                "Year of study must be an integer between 1 and 4."
-            )
 
 
 def _decode_image(image_bytes: bytes) -> np.ndarray:
@@ -403,16 +409,11 @@ def _get_or_create_student(
     roll_no: str,
     name: str,
     branch: str,
+    role: str,
     year_of_study: int | None,
 ):
     """
-    Find an existing student or create a pending student.
-
-    Existing student details are not changed here.
-    Final updates happen only after image and embeddings are saved.
-
-    A duplicate-insert race is handled by checking the roll number
-    again after an insert failure.
+    Find an existing student or create a pending student/user.
     """
     existing_student = _find_student_by_roll_no(
         supabase,
@@ -426,14 +427,12 @@ def _get_or_create_student(
         "roll_no": roll_no,
         "name": name,
         "branch": branch,
-        "role": "student",
+        "role": role,
         "is_active": True,
         "gallery_label": roll_no,
         "enrollment_status": "pending",
+        "year_of_study": year_of_study if role == "student" else None,
     }
-
-    if year_of_study is not None:
-        insert_data["year_of_study"] = year_of_study
 
     try:
         created = (
@@ -444,7 +443,7 @@ def _get_or_create_student(
 
         if not created.data:
             raise EnrollmentError(
-                "Unable to create the pending student record."
+                "Unable to create the pending record."
             )
 
         return created.data[0], True
@@ -453,8 +452,6 @@ def _get_or_create_student(
         raise
 
     except Exception:
-        # Another registration request may have created the same
-        # roll number between our initial lookup and insert.
         existing_student = _find_student_by_roll_no(
             supabase,
             roll_no,
@@ -479,14 +476,8 @@ def _cleanup_enrollment(
     storage_upload_attempted: bool,
     was_created: bool,
 ):
-    """
-    Best-effort rollback of records from this enrollment attempt.
-
-    Never deletes a student record that existed before this attempt.
-    """
     cleanup_errors = []
 
-    # Delete embeddings first because they reference image metadata.
     try:
         (
             supabase.table("student_face_embeddings")
@@ -499,7 +490,6 @@ def _cleanup_enrollment(
             f"Embedding cleanup failed: {type(exc).__name__}"
         )
 
-    # Delete image metadata.
     try:
         (
             supabase.table("student_face_images")
@@ -512,8 +502,6 @@ def _cleanup_enrollment(
             f"Image metadata cleanup failed: {type(exc).__name__}"
         )
 
-    # Remove the unique Storage object even if upload returned
-    # an error after the remote service may have accepted it.
     if storage_upload_attempted:
         try:
             supabase.storage.from_(BUCKET_NAME).remove(
@@ -524,7 +512,6 @@ def _cleanup_enrollment(
                 f"Storage cleanup failed: {type(exc).__name__}"
             )
 
-    # Delete only a student created by this enrollment attempt.
     if was_created:
         try:
             (
@@ -535,7 +522,7 @@ def _cleanup_enrollment(
             )
         except Exception as exc:
             cleanup_errors.append(
-                f"New student cleanup failed: {type(exc).__name__}"
+                f"New record cleanup failed: {type(exc).__name__}"
             )
 
     return cleanup_errors
@@ -550,40 +537,26 @@ def enroll_student(
     roll_no: str,
     name: str,
     branch: str,
+    role: str = "student",
     image_bytes: bytes,
     mime_type: str,
     source_type: str,
     year_of_study: int | None = None,
 ):
     """
-    Register a student using either:
-
-    1. A complete ID-card image.
-    2. A direct face photograph.
-
-    The original uploaded image is saved in private Supabase Storage.
-
-    Database records:
-        students
-        student_face_images
-        student_face_embeddings
-
-    Five normalized ArcFace embeddings are generated for each
-    registration image.
+    Register a user using either ID card or face photograph.
     """
-
-    # -----------------------------------------------------
-    # 1. Normalize and validate registration details
-    # -----------------------------------------------------
-
     if not isinstance(roll_no, str):
-        raise EnrollmentError("Invalid roll number.")
+        raise EnrollmentError("Invalid roll number/ID.")
 
     if not isinstance(name, str):
-        raise EnrollmentError("Invalid student name.")
+        raise EnrollmentError("Invalid name.")
 
     if not isinstance(branch, str):
-        raise EnrollmentError("Invalid branch.")
+        raise EnrollmentError("Invalid branch/department.")
+
+    if not isinstance(role, str):
+        raise EnrollmentError("Invalid role.")
 
     if not isinstance(source_type, str):
         raise EnrollmentError("Invalid registration source.")
@@ -594,6 +567,7 @@ def enroll_student(
     roll_no = roll_no.strip()
     name = name.strip()
     branch = branch.strip()
+    role = role.strip().lower()
     source_type = source_type.strip().lower()
     mime_type = mime_type.strip().lower()
 
@@ -601,6 +575,7 @@ def enroll_student(
         roll_no,
         name,
         branch,
+        role,
         source_type,
         mime_type,
         year_of_study,
@@ -609,27 +584,9 @@ def enroll_student(
     if not isinstance(image_bytes, bytes):
         raise EnrollmentError("Invalid uploaded image data.")
 
-    # -----------------------------------------------------
-    # 2. Decode the original uploaded image
-    # -----------------------------------------------------
-
     image = _decode_image(image_bytes)
-
-    # -----------------------------------------------------
-    # 3. Extract the largest face
-    # -----------------------------------------------------
-
     face = _crop_face(image)
-
-    # -----------------------------------------------------
-    # 4. Generate exactly five variations
-    # -----------------------------------------------------
-
     variations = _create_five_variations(face)
-
-    # -----------------------------------------------------
-    # 5. Generate all embeddings before database writes
-    # -----------------------------------------------------
 
     embeddings = [
         _extract_embedding(variation)
@@ -641,10 +598,6 @@ def enroll_student(
             "Exactly five embeddings are required."
         )
 
-    # -----------------------------------------------------
-    # 6. Prepare Supabase records
-    # -----------------------------------------------------
-
     supabase = get_supabase_client()
 
     student, was_created = _get_or_create_student(
@@ -652,6 +605,7 @@ def enroll_student(
         roll_no,
         name,
         branch,
+        role,
         year_of_study,
     )
 
@@ -663,7 +617,6 @@ def enroll_student(
     )
 
     image_id = str(uuid.uuid4())
-
     image_extension = ALLOWED_MIME_TYPES[mime_type]
 
     storage_path = str(
@@ -676,18 +629,7 @@ def enroll_student(
 
     enrolled_at = datetime.now(timezone.utc).isoformat()
 
-    # -----------------------------------------------------
-    # 7. Persist image, metadata, embeddings and student status
-    # -----------------------------------------------------
-
     try:
-        # -------------------------------------------------
-        # 7A. Upload the original image bytes
-        # -------------------------------------------------
-
-        # Important:
-        # Store the exact uploaded file bytes, not the cropped
-        # face and not an image re-encoded by OpenCV.
         storage_upload_attempted = True
 
         supabase.storage.from_(BUCKET_NAME).upload(
@@ -698,10 +640,6 @@ def enroll_student(
                 "upsert": "false",
             },
         )
-
-        # -------------------------------------------------
-        # 7B. Save image metadata
-        # -------------------------------------------------
 
         image_record = {
             "id": image_id,
@@ -721,16 +659,8 @@ def enroll_student(
                 "Unable to save registration image metadata."
             )
 
-        # -------------------------------------------------
-        # 7C. Save all five ArcFace embeddings
-        # -------------------------------------------------
-
         embedding_records = []
-
-        for index, embedding in enumerate(
-            embeddings,
-            start=1,
-        ):
+        for index, embedding in enumerate(embeddings, start=1):
             embedding_records.append({
                 "student_id": student_id,
                 "image_id": image_id,
@@ -753,24 +683,17 @@ def enroll_student(
                 "All five face embeddings were not saved."
             )
 
-        # -------------------------------------------------
-        # 7D. Finalize student enrollment
-        # -------------------------------------------------
-
-        # This is intentionally the final database operation.
         update_data = {
             "name": name,
             "branch": branch,
-            "role": student.get("role") or "student",
+            "role": role,
             "is_active": True,
             "gallery_label": gallery_label,
             "enrollment_status": "enrolled",
             "face_enrolled_at": enrolled_at,
             "updated_at": enrolled_at,
+            "year_of_study": year_of_study if role == "student" else None,
         }
-
-        if year_of_study is not None:
-            update_data["year_of_study"] = year_of_study
 
         final_student_update_attempted = True
 
@@ -783,28 +706,25 @@ def enroll_student(
 
         if not status_result.data:
             raise EnrollmentError(
-                "Unable to finalize student enrollment."
+                "Unable to finalize enrollment."
             )
 
         enrolled_student = status_result.data[0]
 
         logger.info(
-            "Student enrollment completed: roll_no=%s, image_id=%s",
+            "Enrollment completed successfully: roll_no=%s, role=%s",
             roll_no,
-            image_id,
+            role,
         )
-
-        # -------------------------------------------------
-        # 8. Return frontend-compatible response
-        # -------------------------------------------------
 
         return {
             "success": True,
-            "message": "Student enrolled successfully.",
+            "message": "Enrollment completed successfully.",
             "student": enrolled_student,
             "student_id": student_id,
             "roll_no": roll_no,
             "name": name,
+            "role": role,
             "gallery_label": gallery_label,
             "source_type": source_type,
             "image_id": image_id,
@@ -816,11 +736,6 @@ def enroll_student(
         }
 
     except Exception as exc:
-
-        # -------------------------------------------------
-        # 9. Roll back this enrollment attempt
-        # -------------------------------------------------
-
         cleanup_errors = _cleanup_enrollment(
             supabase,
             student_id=student_id,
@@ -830,8 +745,6 @@ def enroll_student(
             was_created=was_created,
         )
 
-        # If an existing student's final update may have reached
-        # Supabase but the response failed, restore their old values.
         if final_student_update_attempted and not was_created:
             restore_fields = {
                 key: student.get(key)
@@ -846,10 +759,7 @@ def enroll_student(
                     "year_of_study",
                 )
             }
-
-            restore_fields["updated_at"] = datetime.now(
-                timezone.utc
-            ).isoformat()
+            restore_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
 
             try:
                 (
@@ -860,13 +770,12 @@ def enroll_student(
                 )
             except Exception as restore_exc:
                 cleanup_errors.append(
-                    "Student restoration failed: "
-                    f"{type(restore_exc).__name__}"
+                    f"Restoration failed: {type(restore_exc).__name__}"
                 )
 
         if cleanup_errors:
             logger.error(
-                "Enrollment rollback had errors for roll_no=%s: %s",
+                "Rollback errors for roll_no=%s: %s",
                 roll_no,
                 "; ".join(cleanup_errors),
             )
@@ -875,11 +784,10 @@ def enroll_student(
             raise
 
         logger.exception(
-            "Student enrollment failed for roll_no=%s",
+            "Enrollment failed for roll_no=%s",
             roll_no,
         )
 
         raise EnrollmentError(
-            "Student enrollment could not be completed. "
-            "Please verify the image and try again."
+            "Enrollment could not be completed. Please verify the image and try again."
         ) from exc

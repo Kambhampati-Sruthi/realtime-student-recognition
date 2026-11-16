@@ -1,4 +1,3 @@
-
 const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
 )
@@ -173,43 +172,54 @@ export async function enrollStudent({
   name,
   roll_no,
   branch,
+  role = 'student',
   year_of_study,
   source_type = 'id_card',
   image,
 }) {
   if (!name?.trim()) {
-    throw new Error('Student name is required.')
+    throw new Error('Name is required.')
   }
 
   if (!roll_no?.trim()) {
-    throw new Error('Roll number is required.')
+    throw new Error('Roll number / ID is required.')
   }
 
   if (!branch?.trim()) {
-    throw new Error('Branch is required.')
+    throw new Error('Branch / Department is required.')
   }
 
   if (name.trim().length > 150) {
-    throw new Error('Student name must not exceed 150 characters.')
+    throw new Error('Name must not exceed 150 characters.')
   }
 
   if (roll_no.trim().length > 50) {
-    throw new Error('Roll number must not exceed 50 characters.')
+    throw new Error('Roll number / ID must not exceed 50 characters.')
   }
 
   if (branch.trim().length > 100) {
-    throw new Error('Branch must not exceed 100 characters.')
+    throw new Error('Branch / Department must not exceed 100 characters.')
+  }
+
+  const normalizedRole = (role || 'student').trim().toLowerCase()
+
+  if (!['student', 'faculty', 'staff', 'admin'].includes(normalizedRole)) {
+    throw new Error('Invalid role specified.')
   }
 
   if (!['id_card', 'face'].includes(source_type)) {
     throw new Error('Invalid enrollment source type.')
   }
 
-  if (
-    year_of_study !== '' &&
-    year_of_study !== null &&
-    year_of_study !== undefined
-  ) {
+  if (normalizedRole === 'student') {
+    if (
+      year_of_study === '' ||
+      year_of_study === null ||
+      year_of_study === undefined
+    ) {
+      throw new Error('Year of study is required for students.')
+    }
+
     const year = Number(year_of_study)
 
     if (!Number.isInteger(year) || year < 1 || year > 4) {
@@ -218,7 +228,7 @@ export async function enrollStudent({
   }
 
   if (!(image instanceof File)) {
-    throw new Error('Please select or capture a student image.')
+    throw new Error('Please select or capture an image.')
   }
 
   const allowedTypes = [
@@ -244,10 +254,12 @@ export async function enrollStudent({
   formData.append('name', name.trim())
   formData.append('roll_no', roll_no.trim())
   formData.append('branch', branch.trim())
+  formData.append('role', normalizedRole)
   formData.append('source_type', source_type)
-  formData.append('image', image, image.name || 'student-image.jpg')
+  formData.append('image', image, image.name || 'enrollment-image.jpg')
 
   if (
+    normalizedRole === 'student' &&
     year_of_study !== '' &&
     year_of_study !== null &&
     year_of_study !== undefined
